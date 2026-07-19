@@ -1,5 +1,18 @@
 import torch
 from torch import nn
+import math
+
+
+def _apply_rotary_emb(x, sin, cos):
+    """Apply Llama-style RoPE by pairing the two halves of the head dimension."""
+    x_first, x_second = x.chunk(2, dim=-1)
+
+    sin = sin[None, :, None, :]
+    cos = cos[None, :, None, :]
+
+    output_first = x_first * cos - x_second * sin
+    output_second = x_second * cos + x_first * sin
+    return torch.cat((output_first, output_second), dim=-1)
 
 
 class Rope(nn.Module):
@@ -10,13 +23,14 @@ class Rope(nn.Module):
         self.theta_base = theta_base
 
     def _build_rope_sin_cos(self, seq_len, device, dtype):
-        i = torch.arange(0, self.dim, 2, dtype=dtype, device=device)
+        # Calculate positions and frequencies in FP32 for stable long-context RoPE.
+        i = torch.arange(0, self.dim, 2, dtype=torch.float32, device=device)
         inv_freq = 1 / self.theta_base ** (i / self.dim)
 
-        position = torch.arange(0, seq_len, dtype=dtype, device=device)
+        position = torch.arange(0, seq_len, dtype=torch.float32, device=device)
         angles = torch.einsum("i,j->ij", position, inv_freq)
         # seq, dim/2
-        return torch.sin(angles), torch.cos(angles)
+        return torch.sin(angles).to(dtype), torch.cos(angles).to(dtype)
 
     def forward(self, x):
         # x.shape = [B, seq_len, H, head_dim]
@@ -26,25 +40,118 @@ class Rope(nn.Module):
 
         sin_, cos_ = self._build_rope_sin_cos(seq_len, x.device, x.dtype)
 
-        x_even = x[..., ::2]
-        x_ord = x[..., 1::2]
+        return _apply_rotary_emb(x, sin_, cos_)
 
-        sin_ = sin_[None, :, None, :]
-        cos_ = cos_[None, :, None, :]
 
-        y_even = x_even * cos_ - x_ord * sin_
-        y_ord = x_even * sin_ + x_ord * cos_
+class RopeScale(nn.Module):
+    def __init__(
+        self,
+        dim,
+        theta_base=500000.0,
+        scaling_factor=32.0,
+        low_freq_factor=1.0,
+        high_freq_factor=4.0,
+        original_max_position_embeddings=8192,
+    ):
+        super().__init__()
 
-        x[..., ::2] = y_even
-        x[..., 1::2] = y_ord
+        self.dim = dim
+        assert self.dim % 2 == 0
 
-        return x
+        self.theta_base = theta_base
+        self.scaling_factor = scaling_factor
+        self.low_freq_factor = low_freq_factor
+        self.high_freq_factor = high_freq_factor
+        self.original_max_position_embeddings = original_max_position_embeddings
+
+    def _build_rope_sin_cos(self, seq_len, device, dtype):
+        # RoPE 的频率和角度使用 FP32 计算
+        i = torch.arange(
+            0,
+            self.dim,
+            2,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        inv_freq = 1 / self.theta_base ** (i / self.dim)
+
+        # Llama 3.2 的频率分段缩放
+        wavelen = 2 * math.pi / inv_freq
+
+        low_freq_wavelen = self.original_max_position_embeddings / self.low_freq_factor
+
+        high_freq_wavelen = (
+            self.original_max_position_embeddings / self.high_freq_factor
+        )
+
+        # 低频部分：波长很长，频率除以 scaling_factor
+        scaled_inv_freq = inv_freq / self.scaling_factor
+
+        # 中频部分：在原始频率和缩放频率之间平滑插值
+        smooth_factor = (
+            self.original_max_position_embeddings / wavelen - self.low_freq_factor
+        ) / (self.high_freq_factor - self.low_freq_factor)
+
+        smooth_inv_freq = (
+            1 - smooth_factor
+        ) * scaled_inv_freq + smooth_factor * inv_freq
+
+        is_low_freq = wavelen > low_freq_wavelen
+        is_high_freq = wavelen < high_freq_wavelen
+        is_medium_freq = ~(is_low_freq | is_high_freq)
+
+        inv_freq = torch.where(
+            is_low_freq,
+            scaled_inv_freq,
+            inv_freq,
+        )
+
+        inv_freq = torch.where(
+            is_medium_freq,
+            smooth_inv_freq,
+            inv_freq,
+        )
+
+        position = torch.arange(
+            0,
+            seq_len,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        angles = torch.einsum(
+            "i,j->ij",
+            position,
+            inv_freq,
+        )
+
+        sin_ = torch.sin(angles).to(dtype)
+        cos_ = torch.cos(angles).to(dtype)
+
+        return sin_, cos_
+
+    def forward(self, x):
+        # x.shape = [B, seq_len, H, head_dim]
+        bs, seq_len, head_num, head_dim = x.shape
+
+        assert head_dim == self.dim
+
+        sin_, cos_ = self._build_rope_sin_cos(
+            seq_len,
+            x.device,
+            x.dtype,
+        )
+
+        return _apply_rotary_emb(x, sin_, cos_)
 
 
 def _apply_rope_at_position(rope, x, position):
     """Apply RoPE to one vector at a specific position."""
     assert x.ndim == 1
-    rope_input = torch.zeros(1, position + 1, 1, x.shape[0], dtype=x.dtype, device=x.device)
+    rope_input = torch.zeros(
+        1, position + 1, 1, x.shape[0], dtype=x.dtype, device=x.device
+    )
     rope_input[0, position, 0] = x
     return rope(rope_input)[0, position, 0]
 

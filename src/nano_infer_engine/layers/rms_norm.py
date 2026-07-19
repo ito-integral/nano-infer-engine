@@ -23,11 +23,12 @@ class RmsNorm(nn.Module):
             self.register_parameter("weight", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """maybe todo dtype convert"""
+        input_dtype = x.dtype
+        x = x.float()
         x = x / torch.sqrt(torch.mean(torch.square(x), dim=-1, keepdim=True) + self.eps)
         if self.weight is not None:
-            x = self.weight * x
-        return x
+            x = self.weight.float() * x
+        return x.to(input_dtype)
 
 
 if __name__ == "__main__":
@@ -51,4 +52,7 @@ if __name__ == "__main__":
 
     print("max abs diff:", (y_my - y_official).abs().max().item())
     print("allclose:", torch.allclose(y_my, y_official, rtol=1e-5, atol=1e-6))
-    print("compiled_allclose:", torch.allclose(y_my_compiled, y_official, rtol=1e-5, atol=1e-6))
+    print(
+        "compiled_allclose:",
+        torch.allclose(y_my_compiled, y_official, rtol=1e-5, atol=1e-6),
+    )
