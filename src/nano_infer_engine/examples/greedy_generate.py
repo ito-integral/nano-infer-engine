@@ -1,7 +1,7 @@
 import torch
 from nano_infer_engine.generation.config import GenerationConfig
 from nano_infer_engine.generation.greedy import greedy_generate
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 from nano_infer_engine.loaders.llama import load_convert_hf_config, load_llama
 from nano_infer_engine.models.llama import Llama3_2

@@ -10,8 +10,8 @@ from .config import GenerationConfig
 @dataclass
 class GenerationOutput:
     sequences: torch.Tensor
-    generated_tokens: int
-    stopped_by_eos: bool
+    generated_tokens: torch.Tensor
+    stopped_by_eos: torch.Tensor
 
 
 @torch.inference_mode()
@@ -23,11 +23,7 @@ def greedy_generate(
     if input_ids.ndim != 2:
         raise ValueError("input_ids must be a 2D tensor of shape (batch_size, seq_len)")
 
-    if input_ids.shape[0] != 1:
-        raise ValueError("greedy_generate currently supports batch_size=1")
-
     sequences = input_ids
-    stopped_by_eos = False
 
     if config.use_cache:
         kv_cache = KVCache(
@@ -41,16 +37,39 @@ def greedy_generate(
         )
         logits = model(sequences, kv_cache=kv_cache)
 
+    finished = torch.zeros(
+        input_ids.shape[0],
+        dtype=torch.bool,
+        device=input_ids.device,
+    )
+
+    generated_tokens = torch.zeros(
+        input_ids.shape[0],
+        dtype=torch.long,
+        device=input_ids.device,
+    )
+
     for step in range(config.max_new_tokens):
         if not config.use_cache:
             logits = model(sequences)
 
         next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
 
+        # 如果已经是eos的后续还是拼接eos
+        if config.eos_token_id is not None:
+            next_token = torch.where(
+                finished[:, None],
+                torch.full_like(next_token, config.eos_token_id),
+                next_token,
+            )
+
+        generated_tokens += (~finished).long()
         sequences = torch.cat((sequences, next_token), dim=-1)
 
-        if config.eos_token_id is not None and next_token.item() == config.eos_token_id:
-            stopped_by_eos = True
+        if config.eos_token_id is not None:
+            finished |= next_token.squeeze(-1).eq(config.eos_token_id)
+
+        if finished.all():
             break
 
         if config.use_cache and step + 1 < config.max_new_tokens:
@@ -58,6 +77,6 @@ def greedy_generate(
 
     return GenerationOutput(
         sequences=sequences,
-        generated_tokens=sequences.shape[1] - input_ids.shape[1],
-        stopped_by_eos=stopped_by_eos,
+        generated_tokens=generated_tokens,
+        stopped_by_eos=finished,
     )
