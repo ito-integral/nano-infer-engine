@@ -22,7 +22,7 @@ class Llama3Decoder(nn.Module):
 
     def forward(self, x, k_cache=None, v_cache=None, cache_position=0):
         # x.shape: batch_size , seq_len, hidden_size
-        attn_output, new_k_cache, new_v_cache = self.attn(
+        attn_output = self.attn(
             self.pre_norm(x),
             k_cache,
             v_cache,
@@ -31,4 +31,4 @@ class Llama3Decoder(nn.Module):
         h = attn_output + x
         o = self.ffn(self.post_norm(h)) + h
 
-        return o, new_k_cache, new_v_cache
+        return o

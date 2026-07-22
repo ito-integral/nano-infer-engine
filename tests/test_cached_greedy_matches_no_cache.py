@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
+from nano_infer_engine.cache import KVCache
 from nano_infer_engine.loaders.llama import load_convert_hf_config, load_llama
 from nano_infer_engine.models.llama import Llama3_2
 
@@ -20,14 +21,17 @@ MAX_NEW_TOKENS = 4
 def greedy_trace(model, tokens, use_cache):
     sequence = tokens.clone()
     trace = []
-    k_caches = v_caches = None
     if use_cache:
-        logits, k_caches, v_caches = model(
-            sequence,
-            use_cache=True,
-            cache_position=0,
-            cache_capacity=sequence.shape[1] + MAX_NEW_TOKENS,
+        kv_cache = KVCache(
+            num_layers=len(model.decoders),
+            batch_size=tokens.shape[0],
+            capacity=tokens.shape[1] + MAX_NEW_TOKENS,
+            kv_head_num=model.config.kv_head_num,
+            head_dim=model.config.head_dim,
+            dtype=model.embed.weight.dtype,
+            device=tokens.device,
         )
+        logits = model(sequence, kv_cache=kv_cache)
     for step in range(MAX_NEW_TOKENS):
         if not use_cache:
             logits = model(sequence)
@@ -36,13 +40,7 @@ def greedy_trace(model, tokens, use_cache):
         next_token = last_logits.argmax(-1, keepdim=True)
         sequence = torch.cat((sequence, next_token), dim=1)
         if use_cache and step + 1 < MAX_NEW_TOKENS:
-            logits, k_caches, v_caches = model(
-                next_token,
-                k_caches=k_caches,
-                v_caches=v_caches,
-                use_cache=True,
-                cache_position=tokens.shape[1] + step,
-            )
+            logits = model(next_token, kv_cache=kv_cache)
     return sequence, torch.stack(trace, dim=1).float()
 
 

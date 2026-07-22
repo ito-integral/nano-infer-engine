@@ -56,13 +56,9 @@ class MultiHeadAttention(nn.Module):
                 raise ValueError("KV cache capacity exceeded")
             k_cache[:, kv_seq_len:new_kv_seq_len].copy_(k)
             v_cache[:, kv_seq_len:new_kv_seq_len].copy_(v)
-            new_k_cache = k_cache
-            new_v_cache = v_cache
             k = k_cache[:, :new_kv_seq_len]
             v = v_cache[:, :new_kv_seq_len]
         else:
-            new_k_cache = k
-            new_v_cache = v
             new_kv_seq_len = seq_len
 
         q = q.transpose(1, 2)  # bs, head_num, seq_len, head_dim
@@ -94,7 +90,7 @@ class MultiHeadAttention(nn.Module):
         scores = scores.flatten(start_dim=-2, end_dim=-1)
         output = self.o_proj(scores)
         assert output.shape == x.shape
-        return output, new_k_cache, new_v_cache
+        return output
 
 
 class GroupedQueryAttention(nn.Module):
@@ -159,13 +155,10 @@ class GroupedQueryAttention(nn.Module):
                 raise ValueError("KV cache capacity exceeded")
             k_cache[:, kv_seq_len:new_kv_seq_len].copy_(k)
             v_cache[:, kv_seq_len:new_kv_seq_len].copy_(v)
-            new_k_cache = k_cache
-            new_v_cache = v_cache
+
             k = k_cache[:, :new_kv_seq_len]
             v = v_cache[:, :new_kv_seq_len]
         else:
-            new_k_cache = k
-            new_v_cache = v
             new_kv_seq_len = seq_len
 
         q = q.transpose(1, 2)  # bs, q_head_num, seq_len, head_dim
@@ -210,4 +203,4 @@ class GroupedQueryAttention(nn.Module):
         output = self.o_proj(scores)
 
         assert output.shape == x.shape
-        return output, new_k_cache, new_v_cache
+        return output

@@ -4,6 +4,7 @@ from torch import nn
 from nano_infer_engine.layers.rope import Rope, RopeScale
 from nano_infer_engine.layers.decoder import Llama3Decoder
 from nano_infer_engine.layers.rms_norm import RmsNorm
+from nano_infer_engine.cache import KVCache
 
 
 from dataclasses import dataclass, field
@@ -110,6 +111,7 @@ class Llama3_2(nn.Module):
                 for _ in range(config.num_layers)
             ]
         )
+
         self.final_rms = RmsNorm(config.hidden_size, config.norm_eps)
         self.lm_head = nn.Linear(
             config.hidden_size,
@@ -123,58 +125,19 @@ class Llama3_2(nn.Module):
 
     def forward(
         self,
-        x,
-        k_caches=None,
-        v_caches=None,
-        use_cache=False,
-        cache_position=0,
-        cache_capacity=None,
-    ):
+        x: torch.Tensor,
+        kv_cache: KVCache | None = None,
+    ) -> torch.Tensor:
         # x.shape = batch_size, seq_len
-        if (k_caches is None) != (v_caches is None):
-            raise ValueError(
-                "k_caches and v_caches must both be provided or both be None"
-            )
-
-        if k_caches is None and use_cache:
-            if cache_capacity is None:
-                raise ValueError("cache_capacity is required when creating a KV cache")
-            if cache_capacity < cache_position + x.shape[1]:
-                raise ValueError("cache_capacity is too small")
-            cache_shape = (
-                x.shape[0],
-                cache_capacity,
-                self.config.kv_head_num,
-                self.config.head_dim,
-            )
-            k_caches = [
-                torch.empty(
-                    cache_shape,
-                    dtype=self.embed.weight.dtype,
-                    device=x.device,
-                )
-                for _ in self.decoders
-            ]
-            v_caches = [
-                torch.empty(
-                    cache_shape,
-                    dtype=self.embed.weight.dtype,
-                    device=x.device,
-                )
-                for _ in self.decoders
-            ]
-        elif k_caches is None:
-            k_caches = [None] * len(self.decoders)
-            v_caches = [None] * len(self.decoders)
-        else:
-            use_cache = True
-            if len(k_caches) != len(self.decoders):
-                raise ValueError("k_caches length must equal the number of layers")
-            if len(v_caches) != len(self.decoders):
-                raise ValueError("v_caches length must equal the number of layers")
 
         seq_len = x.shape[1]
-        total_seq_len = cache_position + seq_len
+        if kv_cache is not None:
+            kv_cache.validate_append(seq_len)
+            kv_position = kv_cache.position
+        else:
+            kv_position = 0
+
+        total_seq_len = kv_position + seq_len
         if total_seq_len > self.config.max_seq_len:
             raise ValueError(
                 f"Sequence length {total_seq_len} exceeds "
@@ -182,25 +145,19 @@ class Llama3_2(nn.Module):
             )
 
         x = self.embed(x)
-        new_k_caches = []
-        new_v_caches = []
-        for decoder, k_cache, v_cache in zip(
-            self.decoders,
-            k_caches,
-            v_caches,
-        ):
-            x, new_k_cache, new_v_cache = decoder(
-                x,
-                k_cache,
-                v_cache,
-                cache_position,
-            )
-            new_k_caches.append(new_k_cache)
-            new_v_caches.append(new_v_cache)
+
+        for layer_idx, decoder in enumerate(self.decoders):
+            if kv_cache is not None:
+                k_cache, v_cache = kv_cache.get(layer_idx)
+            else:
+                k_cache, v_cache = None, None
+
+            x = decoder(x, k_cache, v_cache, kv_position)
 
         x = self.final_rms(x)
         x = self.lm_head(x)
 
-        if use_cache:
-            return x, new_k_caches, new_v_caches
+        if kv_cache is not None:
+            kv_cache.advance(seq_len)
+
         return x

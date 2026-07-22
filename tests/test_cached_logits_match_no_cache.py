@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 
+from nano_infer_engine.cache import KVCache
 from nano_infer_engine.loaders.llama import load_convert_hf_config, load_llama
 from nano_infer_engine.models.llama import Llama3_2
 
@@ -29,15 +30,19 @@ def test_cached_logits_match_no_cache() -> None:
     with torch.inference_mode():
         expected = model(tokens).float()
         cached_steps = []
-        k_caches = v_caches = None
+        kv_cache = KVCache(
+            num_layers=len(model.decoders),
+            batch_size=tokens.shape[0],
+            capacity=tokens.shape[1],
+            kv_head_num=model.config.kv_head_num,
+            head_dim=model.config.head_dim,
+            dtype=model.embed.weight.dtype,
+            device=tokens.device,
+        )
         for position in range(tokens.shape[1]):
-            logits, k_caches, v_caches = model(
+            logits = model(
                 tokens[:, position : position + 1],
-                k_caches=k_caches,
-                v_caches=v_caches,
-                use_cache=True,
-                cache_position=position,
-                cache_capacity=tokens.shape[1] if position == 0 else None,
+                kv_cache=kv_cache,
             )
             cached_steps.append(logits)
         actual = torch.cat(cached_steps, dim=1).float()
