@@ -22,23 +22,25 @@ class Rope(nn.Module):
         assert self.dim % 2 == 0
         self.theta_base = theta_base
 
-    def _build_rope_sin_cos(self, seq_len, device, dtype):
+    def _build_rope_sin_cos(self, start, end, device, dtype):
         # Calculate positions and frequencies in FP32 for stable long-context RoPE.
         i = torch.arange(0, self.dim, 2, dtype=torch.float32, device=device)
         inv_freq = 1 / self.theta_base ** (i / self.dim)
 
-        position = torch.arange(0, seq_len, dtype=torch.float32, device=device)
+        position = torch.arange(start, end, dtype=torch.float32, device=device)
         angles = torch.einsum("i,j->ij", position, inv_freq)
         # seq, dim/2
         return torch.sin(angles).to(dtype), torch.cos(angles).to(dtype)
 
-    def forward(self, x):
+    def forward(self, x, position_offset=0):
         # x.shape = [B, seq_len, H, head_dim]
         bs, seq_len, head_num, head_dim = x.shape
 
         assert head_dim == self.dim
 
-        sin_, cos_ = self._build_rope_sin_cos(seq_len, x.device, x.dtype)
+        sin_, cos_ = self._build_rope_sin_cos(
+            position_offset, position_offset + seq_len, x.device, x.dtype
+        )
 
         return _apply_rotary_emb(x, sin_, cos_)
 
@@ -64,7 +66,7 @@ class RopeScale(nn.Module):
         self.high_freq_factor = high_freq_factor
         self.original_max_position_embeddings = original_max_position_embeddings
 
-    def _build_rope_sin_cos(self, seq_len, device, dtype):
+    def _build_rope_sin_cos(self, start, end, device, dtype):
         # RoPE 的频率和角度使用 FP32 计算
         i = torch.arange(
             0,
@@ -114,8 +116,8 @@ class RopeScale(nn.Module):
         )
 
         position = torch.arange(
-            0,
-            seq_len,
+            start,
+            end,
             dtype=torch.float32,
             device=device,
         )
@@ -131,16 +133,14 @@ class RopeScale(nn.Module):
 
         return sin_, cos_
 
-    def forward(self, x):
+    def forward(self, x, position_offset=0):
         # x.shape = [B, seq_len, H, head_dim]
         bs, seq_len, head_num, head_dim = x.shape
 
         assert head_dim == self.dim
 
         sin_, cos_ = self._build_rope_sin_cos(
-            seq_len,
-            x.device,
-            x.dtype,
+            position_offset, seq_len + position_offset, x.device, x.dtype
         )
 
         return _apply_rotary_emb(x, sin_, cos_)
