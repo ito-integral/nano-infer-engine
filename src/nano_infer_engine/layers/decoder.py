@@ -20,13 +20,23 @@ class Llama3Decoder(nn.Module):
         self.pre_norm = RmsNorm(hidden_size, eps=norm_eps)
         self.post_norm = RmsNorm(hidden_size, eps=norm_eps)
 
-    def forward(self, x, k_cache=None, v_cache=None, cache_position=0):
+    def forward(
+        self,
+        x,
+        k_cache=None,
+        v_cache=None,
+        cache_position=0,
+        attention_mask=None,
+        position_ids=None,
+    ):
         # x.shape: batch_size , seq_len, hidden_size
         attn_output = self.attn(
             self.pre_norm(x),
             k_cache,
             v_cache,
             cache_position,
+            attention_mask,
+            position_ids,
         )
         h = attn_output + x
         o = self.ffn(self.post_norm(h)) + h

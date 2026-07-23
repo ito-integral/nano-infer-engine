@@ -127,6 +127,8 @@ class Llama3_2(nn.Module):
         self,
         x: torch.Tensor,
         kv_cache: KVCache | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # x.shape = batch_size, seq_len
 
@@ -144,6 +146,43 @@ class Llama3_2(nn.Module):
                 f"max_seq_len={self.config.max_seq_len}"
             )
 
+        batch_size = x.shape[0]
+        # The mask covers both cached keys and tokens from the current forward.
+        # attention_mask.shape = [batch_size, total_seq_len]
+        expected_mask_shape = (batch_size, total_seq_len)
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                expected_mask_shape,
+                dtype=torch.bool,
+                device=x.device,
+            )
+        else:
+            if attention_mask.shape != expected_mask_shape:
+                raise ValueError(
+                    "attention_mask must have shape "
+                    f"{expected_mask_shape}, got {tuple(attention_mask.shape)}"
+                )
+            if attention_mask.device != x.device:
+                raise ValueError("attention_mask must be on the same device as x")
+            attention_mask = attention_mask.bool()
+
+        if position_ids is None:
+            # full_position_ids.shape = [batch_size, total_seq_len]
+            full_position_ids = attention_mask.long().cumsum(dim=1) - 1
+            full_position_ids = full_position_ids.masked_fill(~attention_mask, 0)
+            # Only current Q/K tokens need RoPE positions.
+            # position_ids.shape = [batch_size, seq_len]
+            position_ids = full_position_ids[:, -seq_len:]
+        else:
+            expected_position_shape = (batch_size, seq_len)
+            if position_ids.shape != expected_position_shape:
+                raise ValueError(
+                    "position_ids must have shape "
+                    f"{expected_position_shape}, got {tuple(position_ids.shape)}"
+                )
+            if position_ids.device != x.device:
+                raise ValueError("position_ids must be on the same device as x")
+
         x = self.embed(x)
 
         for layer_idx, decoder in enumerate(self.decoders):
@@ -152,7 +191,14 @@ class Llama3_2(nn.Module):
             else:
                 k_cache, v_cache = None, None
 
-            x = decoder(x, k_cache, v_cache, kv_position)
+            x = decoder(
+                x,
+                k_cache,
+                v_cache,
+                kv_position,
+                attention_mask,
+                position_ids,
+            )
 
         x = self.final_rms(x)
         x = self.lm_head(x)

@@ -7,8 +7,16 @@ def _apply_rotary_emb(x, sin, cos):
     """Apply Llama-style RoPE by pairing the two halves of the head dimension."""
     x_first, x_second = x.chunk(2, dim=-1)
 
-    sin = sin[None, :, None, :]
-    cos = cos[None, :, None, :]
+    if sin.ndim == 2:
+        # [seq_len, head_dim / 2] -> [1, seq_len, 1, head_dim / 2]
+        sin = sin[None, :, None, :]
+        cos = cos[None, :, None, :]
+    elif sin.ndim == 3:
+        # [bs, seq_len, head_dim / 2] -> [bs, seq_len, 1, head_dim / 2]
+        sin = sin[:, :, None, :]
+        cos = cos[:, :, None, :]
+    else:
+        raise ValueError("sin and cos must have shape [seq, dim] or [batch, seq, dim]")
 
     output_first = x_first * cos - x_second * sin
     output_second = x_second * cos + x_first * sin
@@ -22,25 +30,47 @@ class Rope(nn.Module):
         assert self.dim % 2 == 0
         self.theta_base = theta_base
 
+    def _build_inv_freq(self, device):
+        i = torch.arange(0, self.dim, 2, dtype=torch.float32, device=device)
+        return 1 / self.theta_base ** (i / self.dim)
+
     def _build_rope_sin_cos(self, start, end, device, dtype):
         # Calculate positions and frequencies in FP32 for stable long-context RoPE.
-        i = torch.arange(0, self.dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1 / self.theta_base ** (i / self.dim)
+        inv_freq = self._build_inv_freq(device)
 
         position = torch.arange(start, end, dtype=torch.float32, device=device)
         angles = torch.einsum("i,j->ij", position, inv_freq)
         # seq, dim/2
         return torch.sin(angles).to(dtype), torch.cos(angles).to(dtype)
 
-    def forward(self, x, position_offset=0):
+    def forward(self, x, position_offset=0, position_ids=None):
         # x.shape = [B, seq_len, H, head_dim]
         bs, seq_len, head_num, head_dim = x.shape
 
         assert head_dim == self.dim
 
-        sin_, cos_ = self._build_rope_sin_cos(
-            position_offset, position_offset + seq_len, x.device, x.dtype
-        )
+        if position_ids is None:
+            sin_, cos_ = self._build_rope_sin_cos(
+                position_offset,
+                position_offset + seq_len,
+                x.device,
+                x.dtype,
+            )
+        else:
+            if position_ids.shape != (bs, seq_len):
+                raise ValueError(
+                    f"position_ids must have shape {(bs, seq_len)}, "
+                    f"got {tuple(position_ids.shape)}"
+                )
+            inv_freq = self._build_inv_freq(x.device)
+            # [bs, seq_len, 1] * [head_dim / 2]
+            # -> angles.shape = [bs, seq_len, head_dim / 2]
+            angles = (
+                position_ids.to(device=x.device, dtype=torch.float32)[:, :, None]
+                * inv_freq
+            )
+            sin_ = torch.sin(angles).to(x.dtype)
+            cos_ = torch.cos(angles).to(x.dtype)
 
         return _apply_rotary_emb(x, sin_, cos_)
 
@@ -66,8 +96,7 @@ class RopeScale(nn.Module):
         self.high_freq_factor = high_freq_factor
         self.original_max_position_embeddings = original_max_position_embeddings
 
-    def _build_rope_sin_cos(self, start, end, device, dtype):
-        # RoPE 的频率和角度使用 FP32 计算
+    def _build_inv_freq(self, device):
         i = torch.arange(
             0,
             self.dim,
@@ -115,6 +144,12 @@ class RopeScale(nn.Module):
             inv_freq,
         )
 
+        return inv_freq
+
+    def _build_rope_sin_cos(self, start, end, device, dtype):
+        # RoPE 的频率和角度使用 FP32 计算
+        inv_freq = self._build_inv_freq(device)
+
         position = torch.arange(
             start,
             end,
@@ -133,15 +168,34 @@ class RopeScale(nn.Module):
 
         return sin_, cos_
 
-    def forward(self, x, position_offset=0):
+    def forward(self, x, position_offset=0, position_ids=None):
         # x.shape = [B, seq_len, H, head_dim]
         bs, seq_len, head_num, head_dim = x.shape
 
         assert head_dim == self.dim
 
-        sin_, cos_ = self._build_rope_sin_cos(
-            position_offset, seq_len + position_offset, x.device, x.dtype
-        )
+        if position_ids is None:
+            sin_, cos_ = self._build_rope_sin_cos(
+                position_offset,
+                seq_len + position_offset,
+                x.device,
+                x.dtype,
+            )
+        else:
+            if position_ids.shape != (bs, seq_len):
+                raise ValueError(
+                    f"position_ids must have shape {(bs, seq_len)}, "
+                    f"got {tuple(position_ids.shape)}"
+                )
+            inv_freq = self._build_inv_freq(x.device)
+            # [bs, seq_len, 1] * [head_dim / 2]
+            # -> angles.shape = [bs, seq_len, head_dim / 2]
+            angles = (
+                position_ids.to(device=x.device, dtype=torch.float32)[:, :, None]
+                * inv_freq
+            )
+            sin_ = torch.sin(angles).to(x.dtype)
+            cos_ = torch.cos(angles).to(x.dtype)
 
         return _apply_rotary_emb(x, sin_, cos_)
 

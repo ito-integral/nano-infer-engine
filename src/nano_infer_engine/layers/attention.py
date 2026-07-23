@@ -23,7 +23,15 @@ class MultiHeadAttention(nn.Module):
         else:
             self.rope = rope
 
-    def forward(self, x, k_cache=None, v_cache=None, cache_position=0):
+    def forward(
+        self,
+        x,
+        k_cache=None,
+        v_cache=None,
+        cache_position=0,
+        attention_mask=None,
+        position_ids=None,
+    ):
         """
         k_cache/v_cache.shape = bs, cached_len, head_num, head_dim
         """
@@ -47,8 +55,8 @@ class MultiHeadAttention(nn.Module):
         k = k.view(bs, seq_len, self.head_num, self.head_dim)
         v = v.view(bs, seq_len, self.head_num, self.head_dim)
 
-        q = self.rope(q, position_offset=kv_seq_len)
-        k = self.rope(k, position_offset=kv_seq_len)
+        q = self.rope(q, position_offset=kv_seq_len, position_ids=position_ids)
+        k = self.rope(k, position_offset=kv_seq_len, position_ids=position_ids)
 
         if k_cache is not None and v_cache is not None:
             new_kv_seq_len = kv_seq_len + seq_len
@@ -65,7 +73,7 @@ class MultiHeadAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # bs, head_num, seq_len, new_kv_seq_len
+        # qk_scores.shape = [bs, head_num, seq_len, new_kv_seq_len]
         qk_scores = q @ k.transpose(-1, -2) * (self.head_dim**-0.5)
 
         query_positions = torch.arange(
@@ -80,6 +88,21 @@ class MultiHeadAttention(nn.Module):
         mask = key_positions > query_positions
 
         qk_scores = qk_scores.masked_fill(mask, float("-inf"))
+        if attention_mask is not None:
+            if attention_mask.shape != (bs, new_kv_seq_len):
+                raise ValueError(
+                    "attention_mask must match the batch and KV sequence length"
+                )
+            # [bs, new_kv_seq_len] -> [bs, 1, 1, new_kv_seq_len]
+            # Broadcast over attention heads and all query positions.
+            key_padding_mask = ~attention_mask.bool()[:, None, None, :]
+            qk_scores = qk_scores.masked_fill(key_padding_mask, float("-inf"))
+            # [bs, seq_len] -> [bs, 1, seq_len, 1]
+            # Broadcast over attention heads and all key positions.
+            query_padding_mask = ~attention_mask.bool()[
+                :, None, kv_seq_len:new_kv_seq_len, None
+            ]
+            qk_scores = qk_scores.masked_fill(query_padding_mask, 0.0)
 
         scores = torch.softmax(qk_scores, dim=-1, dtype=torch.float32)
         scores = scores.to(v.dtype)
@@ -119,7 +142,15 @@ class GroupedQueryAttention(nn.Module):
         else:
             self.rope = rope
 
-    def forward(self, x, k_cache=None, v_cache=None, cache_position=0):
+    def forward(
+        self,
+        x,
+        k_cache=None,
+        v_cache=None,
+        cache_position=0,
+        attention_mask=None,
+        position_ids=None,
+    ):
         """
         kv_cache.shape = bs, cached_len, kv_head_num, head_dim
         """
@@ -146,8 +177,8 @@ class GroupedQueryAttention(nn.Module):
         k = k.view(bs, seq_len, self.kv_head_num, self.head_dim)
         v = v.view(bs, seq_len, self.kv_head_num, self.head_dim)
 
-        q = self.rope(q, position_offset=kv_seq_len)
-        k = self.rope(k, position_offset=kv_seq_len)
+        q = self.rope(q, position_offset=kv_seq_len, position_ids=position_ids)
+        k = self.rope(k, position_offset=kv_seq_len, position_ids=position_ids)
 
         if k_cache is not None and v_cache is not None:
             new_kv_seq_len = kv_seq_len + seq_len
@@ -172,8 +203,7 @@ class GroupedQueryAttention(nn.Module):
             self.group_num, dim=1
         )  # bs, q_head_num, seq_len, head_dim
 
-        # bs, head_num, seq_len, seq_len
-        # qk_scores = q @ k.transpose(-1, -2) / (self.head_dim**0.5)
+        # qk_scores.shape = [bs, q_head_num, seq_len, new_kv_seq_len]
         qk_scores = q @ k.transpose(-1, -2) * (self.head_dim ** (-0.5))
 
         query_positions = torch.arange(
@@ -192,6 +222,21 @@ class GroupedQueryAttention(nn.Module):
         # mask = mask.triu(diagonal=1)
 
         qk_scores = qk_scores.masked_fill(mask, float("-inf"))
+        if attention_mask is not None:
+            if attention_mask.shape != (bs, new_kv_seq_len):
+                raise ValueError(
+                    "attention_mask must match the batch and KV sequence length"
+                )
+            # [bs, new_kv_seq_len] -> [bs, 1, 1, new_kv_seq_len]
+            # Broadcast over attention heads and all query positions.
+            key_padding_mask = ~attention_mask.bool()[:, None, None, :]
+            qk_scores = qk_scores.masked_fill(key_padding_mask, float("-inf"))
+            # [bs, seq_len] -> [bs, 1, seq_len, 1]
+            # Broadcast over attention heads and all key positions.
+            query_padding_mask = ~attention_mask.bool()[
+                :, None, kv_seq_len:new_kv_seq_len, None
+            ]
+            qk_scores = qk_scores.masked_fill(query_padding_mask, 0.0)
 
         scores = torch.softmax(qk_scores, dim=-1, dtype=torch.float32)
         scores = scores.to(v.dtype)

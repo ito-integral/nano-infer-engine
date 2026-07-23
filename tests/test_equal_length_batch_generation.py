@@ -9,7 +9,11 @@ class _ScriptedModel:
     def __init__(self) -> None:
         self.step = 0
 
-    def __call__(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         next_tokens = (
             torch.tensor([2, 3], device=input_ids.device)
             if self.step == 0

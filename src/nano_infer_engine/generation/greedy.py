@@ -19,9 +19,27 @@ def greedy_generate(
     model,
     input_ids: torch.Tensor,
     config: GenerationConfig,
+    attention_mask: torch.Tensor | None = None,
 ) -> GenerationOutput:
     if input_ids.ndim != 2:
         raise ValueError("input_ids must be a 2D tensor of shape (batch_size, seq_len)")
+    if input_ids.shape[0] == 0 or input_ids.shape[1] == 0:
+        raise ValueError("input_ids must contain at least one sequence and one token")
+
+    if attention_mask is None:
+        # [batch_size, prompt_seq_len]
+        attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+    if attention_mask.shape != input_ids.shape:
+        raise ValueError("attention_mask must have the same shape as input_ids")
+    if attention_mask.device != input_ids.device:
+        raise ValueError("attention_mask must be on the same device as input_ids")
+
+    attention_mask = attention_mask.bool()
+    if not attention_mask.any(dim=1).all():
+        raise ValueError("each sequence must contain at least one non-padding token")
+    if (attention_mask[:, 1:] < attention_mask[:, :-1]).any():
+        raise ValueError("variable-length batches require left padding")
 
     sequences = input_ids
 
@@ -35,7 +53,7 @@ def greedy_generate(
             dtype=model.embed.weight.dtype,
             device=input_ids.device,
         )
-        logits = model(sequences, kv_cache=kv_cache)
+        logits = model(sequences, kv_cache=kv_cache, attention_mask=attention_mask)
 
     finished = torch.zeros(
         input_ids.shape[0],
@@ -51,7 +69,7 @@ def greedy_generate(
 
     for step in range(config.max_new_tokens):
         if not config.use_cache:
-            logits = model(sequences)
+            logits = model(sequences, attention_mask=attention_mask)
 
         next_token = logits[:, -1].argmax(dim=-1, keepdim=True)
 
@@ -72,8 +90,27 @@ def greedy_generate(
         if finished.all():
             break
 
-        if config.use_cache and step + 1 < config.max_new_tokens:
-            logits = model(next_token, kv_cache=kv_cache)
+        if step + 1 < config.max_new_tokens:
+            # Append one valid position for the token generated in this step.
+            # [batch_size, total_seq_len] -> [batch_size, total_seq_len + 1]
+            attention_mask = torch.cat(
+                (
+                    attention_mask,
+                    torch.ones(
+                        (attention_mask.shape[0], 1),
+                        dtype=torch.bool,
+                        device=attention_mask.device,
+                    ),
+                ),
+                dim=1,
+            )
+
+            if config.use_cache:
+                logits = model(
+                    next_token,
+                    kv_cache=kv_cache,
+                    attention_mask=attention_mask,
+                )
 
     return GenerationOutput(
         sequences=sequences,
