@@ -1,18 +1,9 @@
-from dataclasses import dataclass
-
 import torch
 
 from nano_infer_engine.cache import KVCache
 
-from .config import GenerationConfig
-
-
-@dataclass
-class GenerationOutput:
-    sequences: torch.Tensor
-    generated_tokens: torch.Tensor
-    stopped_by_eos: torch.Tensor
-
+from .config import GenerationConfig, GenerationOutput
+from .prefill import prefill
 
 @torch.inference_mode()
 def greedy_generate(
@@ -53,7 +44,12 @@ def greedy_generate(
             dtype=model.embed.weight.dtype,
             device=input_ids.device,
         )
-        logits = model(sequences, kv_cache=kv_cache, attention_mask=attention_mask)
+        logits = prefill(
+            model,
+            sequences,
+            attention_mask,
+            kv_cache,
+        )
 
     finished = torch.zeros(
         input_ids.shape[0],
