@@ -1,9 +1,11 @@
 import torch
 
 from nano_infer_engine.cache import KVCache
+from nano_infer_engine.paged_cache import PagedKVCache
 
 from .config import GenerationConfig, GenerationOutput
 from .prefill import prefill
+
 
 @torch.inference_mode()
 def greedy_generate(
@@ -11,6 +13,7 @@ def greedy_generate(
     input_ids: torch.Tensor,
     config: GenerationConfig,
     attention_mask: torch.Tensor | None = None,
+    kv_cache: KVCache | PagedKVCache | None = None,
 ) -> GenerationOutput:
     if input_ids.ndim != 2:
         raise ValueError("input_ids must be a 2D tensor of shape (batch_size, seq_len)")
@@ -34,16 +37,20 @@ def greedy_generate(
 
     sequences = input_ids
 
+    if not config.use_cache and kv_cache is not None:
+        raise ValueError("kv_cache requires config.use_cache=True")
+
     if config.use_cache:
-        kv_cache = KVCache(
-            num_layers=len(model.decoders),
-            batch_size=input_ids.shape[0],
-            capacity=input_ids.shape[1] + config.max_new_tokens,
-            kv_head_num=model.config.kv_head_num,
-            head_dim=model.config.head_dim,
-            dtype=model.embed.weight.dtype,
-            device=input_ids.device,
-        )
+        if kv_cache is None:
+            kv_cache = KVCache(
+                num_layers=len(model.decoders),
+                batch_size=input_ids.shape[0],
+                capacity=input_ids.shape[1] + config.max_new_tokens,
+                kv_head_num=model.config.kv_head_num,
+                head_dim=model.config.head_dim,
+                dtype=model.embed.weight.dtype,
+                device=input_ids.device,
+            )
         logits = prefill(
             model,
             sequences,
