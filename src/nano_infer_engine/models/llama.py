@@ -5,6 +5,7 @@ from nano_infer_engine.layers.rope import Rope, RopeScale
 from nano_infer_engine.layers.decoder import Llama3Decoder
 from nano_infer_engine.layers.rms_norm import RmsNorm
 from nano_infer_engine.cache import KVCache
+from nano_infer_engine.paged_cache import PagedKVCache
 
 
 from dataclasses import dataclass, field
@@ -126,16 +127,22 @@ class Llama3_2(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        kv_cache: KVCache | None = None,
+        kv_cache: KVCache | PagedKVCache | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
+        sequence_id: str = "default",
     ) -> torch.Tensor:
         # x.shape = batch_size, seq_len
 
+        batch_size = x.shape[0]
         seq_len = x.shape[1]
-        if kv_cache is not None:
+        if isinstance(kv_cache, KVCache):
             kv_cache.validate_append(seq_len)
             kv_position = kv_cache.position
+        elif isinstance(kv_cache, PagedKVCache):
+            if batch_size != 1:
+                raise ValueError("PagedKVCache currently requires batch_size=1")
+            kv_position = kv_cache.get_sequence_length(sequence_id)
         else:
             kv_position = 0
 
@@ -146,7 +153,9 @@ class Llama3_2(nn.Module):
                 f"max_seq_len={self.config.max_seq_len}"
             )
 
-        batch_size = x.shape[0]
+        if isinstance(kv_cache, PagedKVCache):
+            kv_cache.ensure_capacity(sequence_id, total_seq_len)
+
         # The mask covers both cached keys and tokens from the current forward.
         # attention_mask.shape = [batch_size, total_seq_len]
         expected_mask_shape = (batch_size, total_seq_len)
@@ -186,8 +195,30 @@ class Llama3_2(nn.Module):
         x = self.embed(x)
 
         for layer_idx, decoder in enumerate(self.decoders):
-            if kv_cache is not None:
+            if isinstance(kv_cache, KVCache):
                 k_cache, v_cache = kv_cache.get(layer_idx)
+            elif isinstance(kv_cache, PagedKVCache):
+                cache_shape = (
+                    1,
+                    total_seq_len,
+                    kv_cache.kv_head_num,
+                    kv_cache.head_dim,
+                )
+                k_cache = torch.empty(
+                    cache_shape,
+                    dtype=kv_cache.keys.dtype,
+                    device=kv_cache.keys.device,
+                )
+                v_cache = torch.empty_like(k_cache)
+
+                if kv_position > 0:
+                    previous_keys, previous_values = kv_cache.gather(
+                        layer_idx,
+                        sequence_id,
+                        kv_position,
+                    )
+                    k_cache[0, :kv_position].copy_(previous_keys)
+                    v_cache[0, :kv_position].copy_(previous_values)
             else:
                 k_cache, v_cache = None, None
 
@@ -200,10 +231,21 @@ class Llama3_2(nn.Module):
                 position_ids,
             )
 
+            if isinstance(kv_cache, PagedKVCache):
+                kv_cache.write(
+                    layer_idx,
+                    sequence_id,
+                    kv_position,
+                    k_cache[0, kv_position:total_seq_len],
+                    v_cache[0, kv_position:total_seq_len],
+                )
+
         x = self.final_rms(x)
         x = self.lm_head(x)
 
-        if kv_cache is not None:
+        if isinstance(kv_cache, KVCache):
             kv_cache.advance(seq_len)
+        elif isinstance(kv_cache, PagedKVCache):
+            kv_cache.advance(sequence_id, seq_len)
 
         return x

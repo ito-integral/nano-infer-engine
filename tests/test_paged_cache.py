@@ -48,6 +48,32 @@ def test_ensure_capacity_only_allocates_missing_blocks() -> None:
     assert len(cache.get_block_table("request-a")) == 2
 
 
+def test_sequence_length_advances_independently_from_capacity() -> None:
+    cache = _build_cache(num_blocks=3)
+
+    assert cache.get_sequence_length("request-a") == 0
+
+    cache.ensure_capacity("request-a", required_tokens=5)
+    assert cache.get_sequence_length("request-a") == 0
+
+    cache.advance("request-a", 3)
+    assert cache.get_sequence_length("request-a") == 3
+
+    cache.advance("request-a", 2)
+    assert cache.get_sequence_length("request-a") == 5
+
+
+def test_advance_rejects_unallocated_capacity_without_changing_length() -> None:
+    cache = _build_cache(num_blocks=2)
+    cache.ensure_capacity("request-a", required_tokens=4)
+    cache.advance("request-a", 4)
+
+    with pytest.raises(IndexError, match="exceeds allocated capacity"):
+        cache.advance("request-a", 1)
+
+    assert cache.get_sequence_length("request-a") == 4
+
+
 def test_ensure_capacity_keeps_sequence_block_tables_separate() -> None:
     cache = _build_cache(num_blocks=4)
 

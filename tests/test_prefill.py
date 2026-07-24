@@ -3,6 +3,7 @@ import torch
 from nano_infer_engine.cache import KVCache
 from nano_infer_engine.generation.prefill import prefill
 from nano_infer_engine.models.llama import Llama3_2, LlamaConfig
+from nano_infer_engine.paged_cache import PagedKVCache
 
 
 def _build_tiny_model() -> Llama3_2:
@@ -53,6 +54,52 @@ def test_one_shot_prefill_matches_no_cache_logits() -> None:
         model.config.vocab_size,
     )
     assert kv_cache.position == input_ids.shape[1]
+
+
+def test_paged_cache_matches_contiguous_cache_for_prefill_and_decode() -> None:
+    model = _build_tiny_model()
+    prefill_ids = torch.tensor([[1, 4, 7, 9]])
+    decode_ids = torch.tensor([[11]])
+    capacity = prefill_ids.shape[1] + decode_ids.shape[1]
+
+    contiguous_cache = KVCache(
+        num_layers=len(model.decoders),
+        batch_size=1,
+        capacity=capacity,
+        kv_head_num=model.config.kv_head_num,
+        head_dim=model.config.head_dim,
+        dtype=model.embed.weight.dtype,
+        device=prefill_ids.device,
+    )
+    paged_cache = PagedKVCache(
+        num_blocks=3,
+        block_size=2,
+        num_layers=len(model.decoders),
+        kv_head_num=model.config.kv_head_num,
+        head_dim=model.config.head_dim,
+        dtype=model.embed.weight.dtype,
+        device=prefill_ids.device,
+    )
+
+    with torch.inference_mode():
+        contiguous_prefill = model(prefill_ids, kv_cache=contiguous_cache)
+        paged_prefill = model(prefill_ids, kv_cache=paged_cache)
+        contiguous_decode = model(decode_ids, kv_cache=contiguous_cache)
+        paged_decode = model(decode_ids, kv_cache=paged_cache)
+
+    torch.testing.assert_close(paged_prefill, contiguous_prefill)
+    torch.testing.assert_close(paged_decode, contiguous_decode)
+    assert paged_cache.get_sequence_length("default") == capacity
+
+    for layer_index in range(len(model.decoders)):
+        paged_keys, paged_values = paged_cache.gather(
+            layer_index,
+            "default",
+            capacity,
+        )
+        contiguous_keys, contiguous_values = contiguous_cache.get(layer_index)
+        torch.testing.assert_close(paged_keys, contiguous_keys[0, :capacity])
+        torch.testing.assert_close(paged_values, contiguous_values[0, :capacity])
 
 
 def test_one_shot_prefill_supports_left_padded_batch() -> None:

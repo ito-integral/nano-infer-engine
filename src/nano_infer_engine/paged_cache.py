@@ -50,6 +50,7 @@ class PagedKVCache:
         # request ID -> physical block IDs in logical-block order
         # Example: {"request-a": [3, 7, 1]}
         self._block_tables: dict[str, list[int]] = {}
+        self._sequence_lengths: dict[str, int] = {}
 
         storage_shape = (
             num_layers,
@@ -85,8 +86,36 @@ class PagedKVCache:
         new_block_ids = self.allocator.allocate(missing_blocks)
         if block_table is None:
             self._block_tables[sequence_id] = new_block_ids
+            self._sequence_lengths[sequence_id] = 0
         else:
             block_table.extend(new_block_ids)
+
+    def get_sequence_length(self, sequence_id: str) -> int:
+        """Return the number of cached tokens for a sequence."""
+        if not isinstance(sequence_id, str):
+            raise TypeError("sequence_id must be a string")
+        if not sequence_id:
+            raise ValueError("sequence_id must not be empty")
+
+        return self._sequence_lengths.get(sequence_id, 0)
+
+    def advance(self, sequence_id: str, token_count: int) -> None:
+        """Advance a sequence after every layer has written its new K/V tokens."""
+        if not isinstance(sequence_id, str):
+            raise TypeError("sequence_id must be a string")
+        if not sequence_id:
+            raise ValueError("sequence_id must not be empty")
+        if not isinstance(token_count, int) or isinstance(token_count, bool):
+            raise TypeError("token_count must be an integer")
+        if token_count <= 0:
+            raise ValueError("token_count must be positive")
+
+        current_length = self._sequence_lengths[sequence_id]
+        new_length = current_length + token_count
+
+        # Capacity must be allocated before the sequence length is advanced.
+        self._resolve_position(sequence_id, new_length - 1)
+        self._sequence_lengths[sequence_id] = new_length
 
     def get_block_table(self, sequence_id: str) -> tuple[int, ...]:
         """Return a read-only snapshot of a sequence's block table."""
@@ -231,3 +260,4 @@ class PagedKVCache:
         block_ids = self._block_tables[sequence_id]
         self.allocator.free(block_ids)
         del self._block_tables[sequence_id]
+        del self._sequence_lengths[sequence_id]
