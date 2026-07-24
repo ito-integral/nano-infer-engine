@@ -131,18 +131,46 @@ class Llama3_2(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         sequence_id: str = "default",
+        sequence_ids: tuple[str, ...] | None = None,
     ) -> torch.Tensor:
         # x.shape = batch_size, seq_len
 
         batch_size = x.shape[0]
         seq_len = x.shape[1]
+        paged_sequence_ids: tuple[str, ...] | None = None
         if isinstance(kv_cache, KVCache):
             kv_cache.validate_append(seq_len)
             kv_position = kv_cache.position
         elif isinstance(kv_cache, PagedKVCache):
-            if batch_size != 1:
-                raise ValueError("PagedKVCache currently requires batch_size=1")
-            kv_position = kv_cache.get_sequence_length(sequence_id)
+            if sequence_ids is None:
+                if batch_size != 1:
+                    raise ValueError(
+                        "sequence_ids is required for batched paged inference"
+                    )
+                paged_sequence_ids = (sequence_id,)
+            else:
+                if not isinstance(sequence_ids, tuple):
+                    raise TypeError("sequence_ids must be a tuple")
+                if len(sequence_ids) != batch_size:
+                    raise ValueError("sequence_ids must match the batch size")
+                if any(
+                    not isinstance(current_sequence_id, str) or not current_sequence_id
+                    for current_sequence_id in sequence_ids
+                ):
+                    raise ValueError("sequence IDs must be non-empty strings")
+                if len(set(sequence_ids)) != len(sequence_ids):
+                    raise ValueError("sequence IDs must be unique within a batch")
+                paged_sequence_ids = sequence_ids
+
+            paged_sequence_lengths = tuple(
+                kv_cache.get_sequence_length(current_sequence_id)
+                for current_sequence_id in paged_sequence_ids
+            )
+            if len(set(paged_sequence_lengths)) != 1:
+                raise ValueError(
+                    "batched paged inference currently requires equal sequence lengths"
+                )
+            kv_position = paged_sequence_lengths[0]
         else:
             kv_position = 0
 
@@ -154,7 +182,9 @@ class Llama3_2(nn.Module):
             )
 
         if isinstance(kv_cache, PagedKVCache):
-            kv_cache.ensure_capacity(sequence_id, total_seq_len)
+            assert paged_sequence_ids is not None
+            for current_sequence_id in paged_sequence_ids:
+                kv_cache.ensure_capacity(current_sequence_id, total_seq_len)
 
         # The mask covers both cached keys and tokens from the current forward.
         # attention_mask.shape = [batch_size, total_seq_len]
@@ -174,6 +204,9 @@ class Llama3_2(nn.Module):
             if attention_mask.device != x.device:
                 raise ValueError("attention_mask must be on the same device as x")
             attention_mask = attention_mask.bool()
+
+        if isinstance(kv_cache, PagedKVCache) and not bool(attention_mask.all()):
+            raise ValueError("paged inference does not support padding masks")
 
         if position_ids is None:
             # full_position_ids.shape = [batch_size, total_seq_len]
@@ -200,7 +233,7 @@ class Llama3_2(nn.Module):
                 k_cache, v_cache = kv_cache.get(layer_idx)
             elif isinstance(kv_cache, PagedKVCache) and not use_paged_attention:
                 cache_shape = (
-                    1,
+                    batch_size,
                     total_seq_len,
                     kv_cache.kv_head_num,
                     kv_cache.head_dim,
@@ -213,13 +246,17 @@ class Llama3_2(nn.Module):
                 v_cache = torch.empty_like(k_cache)
 
                 if kv_position > 0:
-                    previous_keys, previous_values = kv_cache.gather(
-                        layer_idx,
-                        sequence_id,
-                        kv_position,
-                    )
-                    k_cache[0, :kv_position].copy_(previous_keys)
-                    v_cache[0, :kv_position].copy_(previous_values)
+                    assert paged_sequence_ids is not None
+                    for batch_index, current_sequence_id in enumerate(
+                        paged_sequence_ids
+                    ):
+                        previous_keys, previous_values = kv_cache.gather(
+                            layer_idx,
+                            current_sequence_id,
+                            kv_position,
+                        )
+                        k_cache[batch_index, :kv_position].copy_(previous_keys)
+                        v_cache[batch_index, :kv_position].copy_(previous_values)
             else:
                 k_cache, v_cache = None, None
 
@@ -233,16 +270,19 @@ class Llama3_2(nn.Module):
                 paged_cache=kv_cache if use_paged_attention else None,
                 layer_index=layer_idx if use_paged_attention else None,
                 sequence_id=sequence_id,
+                sequence_ids=paged_sequence_ids if use_paged_attention else None,
             )
 
             if isinstance(kv_cache, PagedKVCache) and not use_paged_attention:
-                kv_cache.write(
-                    layer_idx,
-                    sequence_id,
-                    kv_position,
-                    k_cache[0, kv_position:total_seq_len],
-                    v_cache[0, kv_position:total_seq_len],
-                )
+                assert paged_sequence_ids is not None
+                for batch_index, current_sequence_id in enumerate(paged_sequence_ids):
+                    kv_cache.write(
+                        layer_idx,
+                        current_sequence_id,
+                        kv_position,
+                        k_cache[batch_index, kv_position:total_seq_len],
+                        v_cache[batch_index, kv_position:total_seq_len],
+                    )
 
         x = self.final_rms(x)
         x = self.lm_head(x)
@@ -250,6 +290,8 @@ class Llama3_2(nn.Module):
         if isinstance(kv_cache, KVCache):
             kv_cache.advance(seq_len)
         elif isinstance(kv_cache, PagedKVCache):
-            kv_cache.advance(sequence_id, seq_len)
+            assert paged_sequence_ids is not None
+            for current_sequence_id in paged_sequence_ids:
+                kv_cache.advance(current_sequence_id, seq_len)
 
         return x

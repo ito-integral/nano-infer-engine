@@ -109,6 +109,73 @@ def test_paged_cache_matches_contiguous_cache_for_prefill_and_decode() -> None:
         torch.testing.assert_close(paged_values, contiguous_values[0, :capacity])
 
 
+def test_paged_cache_supports_equal_length_batch_inference() -> None:
+    model = _build_tiny_model()
+    prefill_ids = torch.tensor(
+        [
+            [1, 4, 7],
+            [1, 5, 8],
+        ]
+    )
+    decode_ids = torch.tensor([[9], [11]])
+    sequence_ids = ("request-a", "request-b")
+    capacity = prefill_ids.shape[1] + decode_ids.shape[1]
+
+    contiguous_cache = KVCache(
+        num_layers=len(model.decoders),
+        batch_size=2,
+        capacity=capacity,
+        kv_head_num=model.config.kv_head_num,
+        head_dim=model.config.head_dim,
+        dtype=model.embed.weight.dtype,
+        device=prefill_ids.device,
+    )
+    paged_cache = PagedKVCache(
+        num_blocks=4,
+        block_size=2,
+        num_layers=len(model.decoders),
+        kv_head_num=model.config.kv_head_num,
+        head_dim=model.config.head_dim,
+        dtype=model.embed.weight.dtype,
+        device=prefill_ids.device,
+    )
+
+    with torch.inference_mode():
+        contiguous_prefill = model(prefill_ids, kv_cache=contiguous_cache)
+        paged_prefill = model(
+            prefill_ids,
+            kv_cache=paged_cache,
+            sequence_ids=sequence_ids,
+        )
+        contiguous_decode = model(decode_ids, kv_cache=contiguous_cache)
+        paged_decode = model(
+            decode_ids,
+            kv_cache=paged_cache,
+            sequence_ids=sequence_ids,
+        )
+
+    torch.testing.assert_close(paged_prefill, contiguous_prefill)
+    torch.testing.assert_close(paged_decode, contiguous_decode)
+
+    for batch_index, sequence_id in enumerate(sequence_ids):
+        assert paged_cache.get_sequence_length(sequence_id) == capacity
+        for layer_index in range(len(model.decoders)):
+            paged_keys, paged_values = paged_cache.gather(
+                layer_index,
+                sequence_id,
+                capacity,
+            )
+            contiguous_keys, contiguous_values = contiguous_cache.get(layer_index)
+            torch.testing.assert_close(
+                paged_keys,
+                contiguous_keys[batch_index, :capacity],
+            )
+            torch.testing.assert_close(
+                paged_values,
+                contiguous_values[batch_index, :capacity],
+            )
+
+
 def test_one_shot_prefill_supports_left_padded_batch() -> None:
     model = _build_tiny_model()
     input_ids = torch.tensor([[0, 0, 1, 4], [1, 5, 8, 11]])

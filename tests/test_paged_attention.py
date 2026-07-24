@@ -1,9 +1,11 @@
 import torch
 
+from nano_infer_engine.layers.attention import GroupedQueryAttention
 from nano_infer_engine.layers.paged_attention import (
     batched_paged_attention_reference,
     paged_attention_reference,
 )
+from nano_infer_engine.paged_cache import PagedKVCache
 
 
 def test_paged_attention_matches_contiguous_attention() -> None:
@@ -93,4 +95,83 @@ def test_batched_paged_attention_matches_per_sequence_reference() -> None:
     )
 
     assert actual.shape == queries.shape
+    torch.testing.assert_close(actual, expected)
+
+
+def test_grouped_query_attention_supports_batched_paged_decode() -> None:
+    torch.manual_seed(2)
+
+    attention = GroupedQueryAttention(
+        q_head_num=4,
+        kv_head_num=2,
+        hidden_size=16,
+    ).eval()
+    sequence_ids = ("request-a", "request-b")
+    sequence_lengths = (2, 4)
+    historical_keys = (
+        torch.randn(2, 2, 4),
+        torch.randn(4, 2, 4),
+    )
+    historical_values = (
+        torch.randn(2, 2, 4),
+        torch.randn(4, 2, 4),
+    )
+
+    def build_cache(
+        selected_sequence_ids: tuple[str, ...],
+    ) -> PagedKVCache:
+        required_blocks = sum(
+            (sequence_lengths[sequence_ids.index(current_sequence_id)] + 2) // 2
+            for current_sequence_id in selected_sequence_ids
+        )
+        cache = PagedKVCache(
+            num_blocks=required_blocks,
+            block_size=2,
+            num_layers=1,
+            kv_head_num=2,
+            head_dim=4,
+            dtype=torch.float32,
+            device="cpu",
+        )
+        for current_sequence_id in selected_sequence_ids:
+            source_index = sequence_ids.index(current_sequence_id)
+            sequence_length = sequence_lengths[source_index]
+            cache.ensure_capacity(current_sequence_id, sequence_length + 1)
+            cache.write(
+                0,
+                current_sequence_id,
+                0,
+                historical_keys[source_index],
+                historical_values[source_index],
+            )
+            cache.advance(current_sequence_id, sequence_length)
+        return cache
+
+    x = torch.randn(2, 1, 16)
+    batched_cache = build_cache(sequence_ids)
+    individual_caches = tuple(
+        build_cache((current_sequence_id,)) for current_sequence_id in sequence_ids
+    )
+
+    with torch.inference_mode():
+        actual = attention(
+            x,
+            paged_cache=batched_cache,
+            layer_index=0,
+            sequence_ids=sequence_ids,
+        )
+        expected = torch.cat(
+            [
+                attention(
+                    x[batch_index : batch_index + 1],
+                    paged_cache=individual_caches[batch_index],
+                    layer_index=0,
+                    sequence_id=current_sequence_id,
+                )
+                for batch_index, current_sequence_id in enumerate(sequence_ids)
+            ],
+            dim=0,
+        )
+
+    assert actual.shape == x.shape
     torch.testing.assert_close(actual, expected)

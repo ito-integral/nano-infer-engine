@@ -1,5 +1,5 @@
 from .rope import Rope
-from .paged_attention import paged_attention_reference
+from .paged_attention import batched_paged_attention_reference
 
 import torch
 from torch import nn
@@ -156,6 +156,7 @@ class GroupedQueryAttention(nn.Module):
         paged_cache: PagedKVCache | None = None,
         layer_index: int | None = None,
         sequence_id: str = "default",
+        sequence_ids: tuple[str, ...] | None = None,
     ):
         """
         kv_cache.shape = bs, cached_len, kv_head_num, head_dim
@@ -171,6 +172,55 @@ class GroupedQueryAttention(nn.Module):
             raise ValueError("contiguous cache and paged cache cannot be used together")
 
         kv_seq_len = cache_position
+
+        paged_sequence_ids: tuple[str, ...] | None = None
+        paged_sequence_lengths: tuple[int, ...] | None = None
+        if paged_cache is not None:
+            if seq_len != 1:
+                raise ValueError(
+                    "paged attention reference currently requires seq_len=1"
+                )
+            if layer_index is None:
+                raise ValueError("layer_index is required for paged attention")
+            if attention_mask is not None and not bool(attention_mask.all()):
+                raise ValueError(
+                    "paged attention reference does not support padding masks"
+                )
+
+            if sequence_ids is None:
+                if bs != 1:
+                    raise ValueError(
+                        "sequence_ids is required for batched paged attention"
+                    )
+                paged_sequence_ids = (sequence_id,)
+            else:
+                if not isinstance(sequence_ids, tuple):
+                    raise TypeError("sequence_ids must be a tuple")
+                if len(sequence_ids) != bs:
+                    raise ValueError("sequence_ids must match the batch size")
+                if any(
+                    not isinstance(current_sequence_id, str) or not current_sequence_id
+                    for current_sequence_id in sequence_ids
+                ):
+                    raise ValueError("sequence IDs must be non-empty strings")
+                if len(set(sequence_ids)) != len(sequence_ids):
+                    raise ValueError("sequence IDs must be unique within a batch")
+                paged_sequence_ids = sequence_ids
+
+            paged_sequence_lengths = tuple(
+                paged_cache.get_sequence_length(current_sequence_id)
+                for current_sequence_id in paged_sequence_ids
+            )
+            paged_position_ids = torch.tensor(
+                paged_sequence_lengths,
+                dtype=torch.long,
+                device=x.device,
+            )[:, None]
+            if position_ids is not None and not torch.equal(
+                position_ids, paged_position_ids
+            ):
+                raise ValueError("position_ids must match paged cache sequence lengths")
+            position_ids = paged_position_ids
 
         # x = x.view(bs, seq_len, self.head_num, hidden_size)
         # q.shape =(bs, seq_len, hidden_size)
@@ -189,35 +239,35 @@ class GroupedQueryAttention(nn.Module):
         k = self.rope(k, position_offset=kv_seq_len, position_ids=position_ids)
 
         if paged_cache is not None:
-            if bs != 1 or seq_len != 1:
-                raise ValueError(
-                    "paged attention reference currently requires "
-                    "batch_size=1 and seq_len=1"
-                )
-            if layer_index is None:
-                raise ValueError("layer_index is required for paged attention")
-            if attention_mask is not None and not bool(attention_mask.all()):
-                raise ValueError(
-                    "paged attention reference does not support padding masks"
+            assert paged_sequence_ids is not None
+            assert paged_sequence_lengths is not None
+            assert layer_index is not None
+
+            for batch_index, current_sequence_id in enumerate(paged_sequence_ids):
+                paged_cache.write(
+                    layer_index,
+                    current_sequence_id,
+                    paged_sequence_lengths[batch_index],
+                    k[batch_index],
+                    v[batch_index],
                 )
 
-            new_kv_seq_len = kv_seq_len + 1
-            paged_cache.write(
-                layer_index,
-                sequence_id,
-                kv_seq_len,
-                k[0],
-                v[0],
+            new_sequence_lengths = tuple(
+                sequence_length + 1 for sequence_length in paged_sequence_lengths
             )
-            context = paged_attention_reference(
-                query=q[0, 0],
+            block_tables = tuple(
+                paged_cache.get_block_table(current_sequence_id)
+                for current_sequence_id in paged_sequence_ids
+            )
+            context = batched_paged_attention_reference(
+                query=q[:, 0],
                 key_cache=paged_cache.keys,
                 value_cache=paged_cache.values,
-                block_table=paged_cache.get_block_table(sequence_id),
-                sequence_length=new_kv_seq_len,
+                block_tables=block_tables,
+                sequence_lengths=new_sequence_lengths,
                 layer_index=layer_index,
             )
-            context = context.reshape(1, 1, self.hidden_size)
+            context = context.reshape(bs, 1, self.hidden_size)
             output = self.o_proj(context)
             assert output.shape == x.shape
             return output
