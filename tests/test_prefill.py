@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import torch
 
 from nano_infer_engine.cache import KVCache
@@ -85,7 +87,12 @@ def test_paged_cache_matches_contiguous_cache_for_prefill_and_decode() -> None:
         contiguous_prefill = model(prefill_ids, kv_cache=contiguous_cache)
         paged_prefill = model(prefill_ids, kv_cache=paged_cache)
         contiguous_decode = model(decode_ids, kv_cache=contiguous_cache)
-        paged_decode = model(decode_ids, kv_cache=paged_cache)
+        with patch.object(
+            paged_cache,
+            "gather",
+            side_effect=AssertionError("decode must not gather paged K/V"),
+        ):
+            paged_decode = model(decode_ids, kv_cache=paged_cache)
 
     torch.testing.assert_close(paged_prefill, contiguous_prefill)
     torch.testing.assert_close(paged_decode, contiguous_decode)

@@ -28,6 +28,10 @@ class Llama3Decoder(nn.Module):
         cache_position=0,
         attention_mask=None,
         position_ids=None,
+        *,
+        paged_cache=None,
+        layer_index=None,
+        sequence_id="default",
     ):
         # x.shape: batch_size , seq_len, hidden_size
         attn_output = self.attn(
@@ -37,6 +41,9 @@ class Llama3Decoder(nn.Module):
             cache_position,
             attention_mask,
             position_ids,
+            paged_cache=paged_cache,
+            layer_index=layer_index,
+            sequence_id=sequence_id,
         )
         h = attn_output + x
         o = self.ffn(self.post_norm(h)) + h

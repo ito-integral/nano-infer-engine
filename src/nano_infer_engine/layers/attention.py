@@ -1,7 +1,10 @@
 from .rope import Rope
+from .paged_attention import paged_attention_reference
 
 import torch
 from torch import nn
+
+from nano_infer_engine.paged_cache import PagedKVCache
 
 
 class MultiHeadAttention(nn.Module):
@@ -42,7 +45,6 @@ class MultiHeadAttention(nn.Module):
             raise ValueError(
                 "k_cache and v_cache must both be provided or both be None"
             )
-
         kv_seq_len = cache_position
 
         # x = x.view(bs, seq_len, self.head_num, hidden_size)
@@ -150,6 +152,10 @@ class GroupedQueryAttention(nn.Module):
         cache_position=0,
         attention_mask=None,
         position_ids=None,
+        *,
+        paged_cache: PagedKVCache | None = None,
+        layer_index: int | None = None,
+        sequence_id: str = "default",
     ):
         """
         kv_cache.shape = bs, cached_len, kv_head_num, head_dim
@@ -161,6 +167,8 @@ class GroupedQueryAttention(nn.Module):
             raise ValueError(
                 "k_cache and v_cache must both be provided or both be None"
             )
+        if paged_cache is not None and (k_cache is not None or v_cache is not None):
+            raise ValueError("contiguous cache and paged cache cannot be used together")
 
         kv_seq_len = cache_position
 
@@ -179,6 +187,40 @@ class GroupedQueryAttention(nn.Module):
 
         q = self.rope(q, position_offset=kv_seq_len, position_ids=position_ids)
         k = self.rope(k, position_offset=kv_seq_len, position_ids=position_ids)
+
+        if paged_cache is not None:
+            if bs != 1 or seq_len != 1:
+                raise ValueError(
+                    "paged attention reference currently requires "
+                    "batch_size=1 and seq_len=1"
+                )
+            if layer_index is None:
+                raise ValueError("layer_index is required for paged attention")
+            if attention_mask is not None and not bool(attention_mask.all()):
+                raise ValueError(
+                    "paged attention reference does not support padding masks"
+                )
+
+            new_kv_seq_len = kv_seq_len + 1
+            paged_cache.write(
+                layer_index,
+                sequence_id,
+                kv_seq_len,
+                k[0],
+                v[0],
+            )
+            context = paged_attention_reference(
+                query=q[0, 0],
+                key_cache=paged_cache.keys,
+                value_cache=paged_cache.values,
+                block_table=paged_cache.get_block_table(sequence_id),
+                sequence_length=new_kv_seq_len,
+                layer_index=layer_index,
+            )
+            context = context.reshape(1, 1, self.hidden_size)
+            output = self.o_proj(context)
+            assert output.shape == x.shape
+            return output
 
         if k_cache is not None and v_cache is not None:
             new_kv_seq_len = kv_seq_len + seq_len

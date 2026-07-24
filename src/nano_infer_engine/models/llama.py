@@ -193,11 +193,12 @@ class Llama3_2(nn.Module):
                 raise ValueError("position_ids must be on the same device as x")
 
         x = self.embed(x)
+        use_paged_attention = isinstance(kv_cache, PagedKVCache) and seq_len == 1
 
         for layer_idx, decoder in enumerate(self.decoders):
             if isinstance(kv_cache, KVCache):
                 k_cache, v_cache = kv_cache.get(layer_idx)
-            elif isinstance(kv_cache, PagedKVCache):
+            elif isinstance(kv_cache, PagedKVCache) and not use_paged_attention:
                 cache_shape = (
                     1,
                     total_seq_len,
@@ -229,9 +230,12 @@ class Llama3_2(nn.Module):
                 kv_position,
                 attention_mask,
                 position_ids,
+                paged_cache=kv_cache if use_paged_attention else None,
+                layer_index=layer_idx if use_paged_attention else None,
+                sequence_id=sequence_id,
             )
 
-            if isinstance(kv_cache, PagedKVCache):
+            if isinstance(kv_cache, PagedKVCache) and not use_paged_attention:
                 kv_cache.write(
                     layer_idx,
                     sequence_id,

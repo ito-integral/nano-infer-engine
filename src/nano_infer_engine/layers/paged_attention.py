@@ -101,10 +101,14 @@ def paged_attention_reference(
         value_blocks.append(value_block)
 
     # Restore logical token order across physical blocks.
-    scores = torch.cat(score_blocks, dim=-1) # Shape: (q_head_num, sequence_length)
-    values = torch.cat(value_blocks, dim=0) # Shape: (sequence_length, q_head_num, head_dim)
+    scores = torch.cat(score_blocks, dim=-1)  # Shape: (q_head_num, sequence_length)
+    values = torch.cat(
+        value_blocks, dim=0
+    )  # Shape: (sequence_length, q_head_num, head_dim)
 
-    weights = torch.softmax(scores, dim=-1, dtype=torch.float32) # (q_head_num, sequence_length)
+    weights = torch.softmax(
+        scores, dim=-1, dtype=torch.float32
+    )  # (q_head_num, sequence_length)
     weights = weights.to(values.dtype)
 
-    return torch.einsum("ht,thd->hd", weights, values) # Shape: (q_head_num, head_dim)
+    return torch.einsum("ht,thd->hd", weights, values)  # Shape: (q_head_num, head_dim)
