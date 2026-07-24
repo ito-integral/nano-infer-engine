@@ -1,6 +1,9 @@
 import torch
 
-from nano_infer_engine.layers.paged_attention import paged_attention_reference
+from nano_infer_engine.layers.paged_attention import (
+    batched_paged_attention_reference,
+    paged_attention_reference,
+)
 
 
 def test_paged_attention_matches_contiguous_attention() -> None:
@@ -48,4 +51,46 @@ def test_paged_attention_matches_contiguous_attention() -> None:
         layer_index,
     )
 
+    torch.testing.assert_close(actual, expected)
+
+
+def test_batched_paged_attention_matches_per_sequence_reference() -> None:
+    torch.manual_seed(1)
+
+    queries = torch.randn(3, 4, 3)
+    key_cache = torch.randn(2, 7, 2, 2, 3)
+    value_cache = torch.randn_like(key_cache)
+    block_tables = (
+        (5, 1),
+        (4, 0, 6),
+        (2,),
+    )
+    sequence_lengths = (3, 5, 2)
+    layer_index = 1
+
+    expected = torch.stack(
+        [
+            paged_attention_reference(
+                query=queries[batch_index],
+                key_cache=key_cache,
+                value_cache=value_cache,
+                block_table=block_tables[batch_index],
+                sequence_length=sequence_lengths[batch_index],
+                layer_index=layer_index,
+            )
+            for batch_index in range(queries.shape[0])
+        ],
+        dim=0,
+    )
+
+    actual = batched_paged_attention_reference(
+        query=queries,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        block_tables=block_tables,
+        sequence_lengths=sequence_lengths,
+        layer_index=layer_index,
+    )
+
+    assert actual.shape == queries.shape
     torch.testing.assert_close(actual, expected)

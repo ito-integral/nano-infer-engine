@@ -112,3 +112,65 @@ def paged_attention_reference(
     weights = weights.to(values.dtype)
 
     return torch.einsum("ht,thd->hd", weights, values)  # Shape: (q_head_num, head_dim)
+
+
+def batched_paged_attention_reference(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: tuple[tuple[int, ...], ...],
+    sequence_lengths: tuple[int, ...],
+    layer_index: int,
+) -> torch.Tensor:
+    """Compute single-token decode attention for a fixed batch of sequences.
+
+    Expected shapes:
+        query: (batch_size, q_head_num, head_dim)
+        key_cache/value_cache:
+            (num_layers, num_blocks, block_size, kv_head_num, head_dim)
+        output: (batch_size, q_head_num, head_dim)
+
+    Each batch row has its own block table and sequence length. This reference
+    version reuses ``paged_attention_reference`` per sequence; it is a
+    correctness baseline rather than a vectorized implementation.
+    """
+    if not isinstance(query, torch.Tensor):
+        raise TypeError("query must be a torch.Tensor")
+    if query.ndim != 3:
+        raise ValueError("query must be a 3D tensor")
+
+    batch_size = query.shape[0]
+    if batch_size <= 0:
+        raise ValueError("query batch size must be positive")
+
+    if not isinstance(block_tables, tuple):
+        raise TypeError("block_tables must be a tuple")
+    if not isinstance(sequence_lengths, tuple):
+        raise TypeError("sequence_lengths must be a tuple")
+    if len(block_tables) != batch_size:
+        raise ValueError("block_tables must match the query batch size")
+    if len(sequence_lengths) != batch_size:
+        raise ValueError("sequence_lengths must match the query batch size")
+    if any(not isinstance(block_table, tuple) for block_table in block_tables):
+        raise TypeError("each block table must be a tuple")
+    if any(
+        not isinstance(sequence_length, int) or isinstance(sequence_length, bool)
+        for sequence_length in sequence_lengths
+    ):
+        raise TypeError("sequence lengths must be integers")
+    if any(sequence_length <= 0 for sequence_length in sequence_lengths):
+        raise ValueError("sequence lengths must be positive")
+
+    outputs = []
+    for batch_index in range(batch_size):
+        output = paged_attention_reference(
+            query=query[batch_index],
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=block_tables[batch_index],
+            sequence_length=sequence_lengths[batch_index],
+            layer_index=layer_index,
+        )
+        outputs.append(output)
+
+    return torch.stack(outputs, dim=0)
