@@ -137,7 +137,9 @@ class Llama3_2(nn.Module):
 
         batch_size = x.shape[0]
         seq_len = x.shape[1]
+        use_paged_attention = isinstance(kv_cache, PagedKVCache) and seq_len == 1
         paged_sequence_ids: tuple[str, ...] | None = None
+        paged_sequence_lengths: tuple[int, ...] | None = None
         if isinstance(kv_cache, KVCache):
             kv_cache.validate_append(seq_len)
             kv_position = kv_cache.position
@@ -166,15 +168,19 @@ class Llama3_2(nn.Module):
                 kv_cache.get_sequence_length(current_sequence_id)
                 for current_sequence_id in paged_sequence_ids
             )
-            if len(set(paged_sequence_lengths)) != 1:
+            if not use_paged_attention and len(set(paged_sequence_lengths)) != 1:
                 raise ValueError(
-                    "batched paged inference currently requires equal sequence lengths"
+                    "batched paged prefill currently requires equal sequence lengths"
                 )
             kv_position = paged_sequence_lengths[0]
         else:
             kv_position = 0
 
-        total_seq_len = kv_position + seq_len
+        if use_paged_attention:
+            assert paged_sequence_lengths is not None
+            total_seq_len = max(paged_sequence_lengths) + 1
+        else:
+            total_seq_len = kv_position + seq_len
         if total_seq_len > self.config.max_seq_len:
             raise ValueError(
                 f"Sequence length {total_seq_len} exceeds "
@@ -183,32 +189,67 @@ class Llama3_2(nn.Module):
 
         if isinstance(kv_cache, PagedKVCache):
             assert paged_sequence_ids is not None
-            for current_sequence_id in paged_sequence_ids:
-                kv_cache.ensure_capacity(current_sequence_id, total_seq_len)
-
-        # The mask covers both cached keys and tokens from the current forward.
-        # attention_mask.shape = [batch_size, total_seq_len]
-        expected_mask_shape = (batch_size, total_seq_len)
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                expected_mask_shape,
-                dtype=torch.bool,
-                device=x.device,
-            )
-        else:
-            if attention_mask.shape != expected_mask_shape:
-                raise ValueError(
-                    "attention_mask must have shape "
-                    f"{expected_mask_shape}, got {tuple(attention_mask.shape)}"
+            assert paged_sequence_lengths is not None
+            for batch_index, current_sequence_id in enumerate(paged_sequence_ids):
+                required_tokens = (
+                    paged_sequence_lengths[batch_index] + 1
+                    if use_paged_attention
+                    else total_seq_len
                 )
-            if attention_mask.device != x.device:
-                raise ValueError("attention_mask must be on the same device as x")
-            attention_mask = attention_mask.bool()
+                kv_cache.ensure_capacity(current_sequence_id, required_tokens)
 
-        if isinstance(kv_cache, PagedKVCache) and not bool(attention_mask.all()):
-            raise ValueError("paged inference does not support padding masks")
+        if use_paged_attention:
+            if attention_mask is not None:
+                if attention_mask.device != x.device:
+                    raise ValueError("attention_mask must be on the same device as x")
+                if not bool(attention_mask.all()):
+                    raise ValueError("paged inference does not support padding masks")
+                attention_mask = attention_mask.bool()
+
+            assert paged_sequence_lengths is not None
+            paged_position_ids = torch.tensor(
+                paged_sequence_lengths,
+                dtype=torch.long,
+                device=x.device,
+            )[:, None]
+            if position_ids is None:
+                position_ids = paged_position_ids
+            else:
+                if position_ids.shape != (batch_size, 1):
+                    raise ValueError(
+                        "position_ids must have shape "
+                        f"{(batch_size, 1)}, got {tuple(position_ids.shape)}"
+                    )
+                if position_ids.device != x.device:
+                    raise ValueError("position_ids must be on the same device as x")
+                if not torch.equal(position_ids, paged_position_ids):
+                    raise ValueError(
+                        "position_ids must match paged cache sequence lengths"
+                    )
+        else:
+            # The mask covers both cached keys and current input tokens.
+            expected_mask_shape = (batch_size, total_seq_len)
+            if attention_mask is None:
+                attention_mask = torch.ones(
+                    expected_mask_shape,
+                    dtype=torch.bool,
+                    device=x.device,
+                )
+            else:
+                if attention_mask.shape != expected_mask_shape:
+                    raise ValueError(
+                        "attention_mask must have shape "
+                        f"{expected_mask_shape}, got {tuple(attention_mask.shape)}"
+                    )
+                if attention_mask.device != x.device:
+                    raise ValueError("attention_mask must be on the same device as x")
+                attention_mask = attention_mask.bool()
+
+            if isinstance(kv_cache, PagedKVCache) and not bool(attention_mask.all()):
+                raise ValueError("paged inference does not support padding masks")
 
         if position_ids is None:
+            assert attention_mask is not None
             # full_position_ids.shape = [batch_size, total_seq_len]
             full_position_ids = attention_mask.long().cumsum(dim=1) - 1
             full_position_ids = full_position_ids.masked_fill(~attention_mask, 0)
@@ -226,7 +267,6 @@ class Llama3_2(nn.Module):
                 raise ValueError("position_ids must be on the same device as x")
 
         x = self.embed(x)
-        use_paged_attention = isinstance(kv_cache, PagedKVCache) and seq_len == 1
 
         for layer_idx, decoder in enumerate(self.decoders):
             if isinstance(kv_cache, KVCache):

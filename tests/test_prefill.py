@@ -176,6 +176,50 @@ def test_paged_cache_supports_equal_length_batch_inference() -> None:
             )
 
 
+def test_paged_cache_supports_unequal_length_batched_decode() -> None:
+    model = _build_tiny_model()
+    prompts = (
+        torch.tensor([[1, 4]]),
+        torch.tensor([[1, 5, 8, 11]]),
+    )
+    decode_ids = torch.tensor([[9], [12]])
+    sequence_ids = ("request-a", "request-b")
+    paged_cache = PagedKVCache(
+        num_blocks=5,
+        block_size=2,
+        num_layers=len(model.decoders),
+        kv_head_num=model.config.kv_head_num,
+        head_dim=model.config.head_dim,
+        dtype=model.embed.weight.dtype,
+        device=decode_ids.device,
+    )
+
+    with torch.inference_mode():
+        for prompt, sequence_id in zip(prompts, sequence_ids):
+            model(
+                prompt,
+                kv_cache=paged_cache,
+                sequence_id=sequence_id,
+            )
+
+        actual = model(
+            decode_ids,
+            kv_cache=paged_cache,
+            sequence_ids=sequence_ids,
+        )
+        expected = torch.cat(
+            [
+                model(torch.cat((prompt, decode_ids[index : index + 1]), dim=1))[:, -1:]
+                for index, prompt in enumerate(prompts)
+            ],
+            dim=0,
+        )
+
+    torch.testing.assert_close(actual, expected)
+    assert paged_cache.get_sequence_length("request-a") == 3
+    assert paged_cache.get_sequence_length("request-b") == 5
+
+
 def test_one_shot_prefill_supports_left_padded_batch() -> None:
     model = _build_tiny_model()
     input_ids = torch.tensor([[0, 0, 1, 4], [1, 5, 8, 11]])
