@@ -27,3 +27,10 @@ class GenerationOutput:
     sequences: torch.Tensor
     generated_tokens: torch.Tensor
     stopped_by_eos: torch.Tensor
+
+
+@dataclass
+class RaggedGenerationOutput:
+    sequences: tuple[torch.Tensor, ...]
+    generated_tokens: torch.Tensor
+    stopped_by_eos: torch.Tensor
