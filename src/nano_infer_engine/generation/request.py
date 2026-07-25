@@ -12,6 +12,8 @@ class PagedRequest:
     sequence: torch.Tensor = field(init=False)
     generated_tokens: int = 0
     finished: bool = False
+    required_blocks: int = 0
+    last_logits: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         self.sequence = self.prompt

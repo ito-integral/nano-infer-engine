@@ -3,14 +3,12 @@ import torch
 from nano_infer_engine.paged_cache import PagedKVCache
 
 
-@torch.inference_mode()
-def paged_prefill(
-    model,
+def _validate_paged_prefill_inputs(
     prompts: tuple[torch.Tensor, ...],
     paged_cache: PagedKVCache,
     sequence_ids: tuple[str, ...],
-) -> torch.Tensor:
-    """Prefill variable-length prompts without storing padding tokens."""
+) -> None:
+    """Validate prefill inputs without mutating the paged cache."""
     if not isinstance(paged_cache, PagedKVCache):
         raise TypeError("paged_cache must be a PagedKVCache")
     if not isinstance(prompts, tuple):
@@ -46,6 +44,17 @@ def paged_prefill(
         except KeyError:
             continue
         raise ValueError(f"sequence ID already exists: {sequence_id}")
+
+
+@torch.inference_mode()
+def paged_prefill(
+    model,
+    prompts: tuple[torch.Tensor, ...],
+    paged_cache: PagedKVCache,
+    sequence_ids: tuple[str, ...],
+) -> torch.Tensor:
+    """Prefill variable-length prompts without storing padding tokens."""
+    _validate_paged_prefill_inputs(prompts, paged_cache, sequence_ids)
 
     required_blocks = sum(
         (prompt.shape[1] + paged_cache.block_size - 1) // paged_cache.block_size

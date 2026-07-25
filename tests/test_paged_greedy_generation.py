@@ -24,6 +24,8 @@ class _ScriptedPagedModel:
         self.token_schedules = token_schedules
         self.next_schedule_indices = {sequence_id: 0 for sequence_id in token_schedules}
         self.decode_batch_sizes: list[int] = []
+        self.decode_sequence_ids: list[tuple[str, ...]] = []
+        self.prefill_sequence_ids: list[str] = []
 
     def __call__(
         self,
@@ -36,10 +38,12 @@ class _ScriptedPagedModel:
         if sequence_ids is None:
             current_sequence_ids = (sequence_id,)
             token_count = input_ids.shape[1]
+            self.prefill_sequence_ids.append(sequence_id)
         else:
             current_sequence_ids = sequence_ids
             token_count = 1
             self.decode_batch_sizes.append(len(sequence_ids))
+            self.decode_sequence_ids.append(sequence_ids)
 
         logits = torch.zeros(
             len(current_sequence_ids),
@@ -201,4 +205,90 @@ def test_paged_greedy_retires_eos_requests_and_releases_blocks() -> None:
     assert torch.equal(output.generated_tokens, torch.tensor([1, 3, 2]))
     assert output.stopped_by_eos.all()
     assert model.decode_batch_sizes == [2, 1]
+    assert cache.allocator.allocated_block_count == 0
+
+
+def test_paged_greedy_admits_pending_requests_after_eos() -> None:
+    eos_token_id = 2
+    model = _ScriptedPagedModel(
+        {
+            "request-a": (eos_token_id,),
+            "request-b": (3, 4, eos_token_id),
+            "request-c": (5, eos_token_id),
+        }
+    )
+    cache = PagedKVCache(
+        num_blocks=8,
+        block_size=1,
+        num_layers=1,
+        kv_head_num=1,
+        head_dim=1,
+        dtype=torch.float32,
+        device="cpu",
+    )
+
+    output = paged_greedy_generate(
+        model,
+        (
+            torch.tensor([[6]]),
+            torch.tensor([[6]]),
+            torch.tensor([[6]]),
+        ),
+        GenerationConfig(
+            max_new_tokens=4,
+            eos_token_id=eos_token_id,
+            use_cache=True,
+        ),
+        cache,
+        ("request-a", "request-b", "request-c"),
+        max_batch_size=2,
+    )
+
+    assert model.prefill_sequence_ids == [
+        "request-a",
+        "request-b",
+        "request-c",
+    ]
+    assert model.decode_sequence_ids == [
+        ("request-b",),
+        ("request-b", "request-c"),
+    ]
+    assert torch.equal(output.generated_tokens, torch.tensor([1, 3, 2]))
+    assert output.stopped_by_eos.all()
+    assert cache.allocator.allocated_block_count == 0
+
+
+def test_paged_greedy_admits_pending_requests_after_token_limit() -> None:
+    model = _ScriptedPagedModel(
+        {
+            "request-a": (3, 4),
+            "request-b": (5, 6),
+        }
+    )
+    cache = PagedKVCache(
+        num_blocks=2,
+        block_size=1,
+        num_layers=1,
+        kv_head_num=1,
+        head_dim=1,
+        dtype=torch.float32,
+        device="cpu",
+    )
+
+    output = paged_greedy_generate(
+        model,
+        (torch.tensor([[1]]), torch.tensor([[1]])),
+        GenerationConfig(max_new_tokens=2, use_cache=True),
+        cache,
+        ("request-a", "request-b"),
+        max_batch_size=1,
+    )
+
+    assert model.prefill_sequence_ids == ["request-a", "request-b"]
+    assert model.decode_sequence_ids == [
+        ("request-a",),
+        ("request-b",),
+    ]
+    assert torch.equal(output.generated_tokens, torch.tensor([2, 2]))
+    assert not output.stopped_by_eos.any()
     assert cache.allocator.allocated_block_count == 0
