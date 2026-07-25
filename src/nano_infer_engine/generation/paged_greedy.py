@@ -4,6 +4,7 @@ from nano_infer_engine.paged_cache import PagedKVCache
 
 from .config import GenerationConfig, RaggedGenerationOutput
 from .paged_prefill import paged_prefill
+from .request import PagedRequest
 
 
 @torch.inference_mode()
@@ -44,22 +45,21 @@ def paged_greedy_generate(
         paged_cache,
         sequence_ids,
     )
-    sequences = list(prompts)
-    request_count = len(prompts)
+    requests = [
+        PagedRequest(sequence_id=sequence_id, prompt=prompt)
+        for prompt, sequence_id in zip(prompts, sequence_ids)
+    ]
+    active_requests = list(requests)
     device = prompts[0].device
-
-    finished = torch.zeros(request_count, dtype=torch.bool, device=device)
-    generated_tokens = torch.zeros(request_count, dtype=torch.long, device=device)
-    active_indices = list(range(request_count))
 
     for step in range(config.max_new_tokens):
         next_tokens = last_logits.argmax(dim=-1, keepdim=True)
 
-        for local_index, original_index in enumerate(active_indices):
-            generated_tokens[original_index] += 1
-            sequences[original_index] = torch.cat(
+        for local_index, request in enumerate(active_requests):
+            request.generated_tokens += 1
+            request.sequence = torch.cat(
                 (
-                    sequences[original_index],
+                    request.sequence,
                     next_tokens[local_index : local_index + 1],
                 ),
                 dim=1,
@@ -69,29 +69,29 @@ def paged_greedy_generate(
             finished_now = next_tokens.squeeze(-1).eq(config.eos_token_id)
         else:
             finished_now = torch.zeros(
-                len(active_indices),
+                len(active_requests),
                 dtype=torch.bool,
                 device=device,
             )
 
         survivor_local_indices = []
-        for local_index, original_index in enumerate(active_indices):
+        survivor_requests = []
+        for local_index, request in enumerate(active_requests):
             if bool(finished_now[local_index]):
-                finished[original_index] = True
-                paged_cache.release(sequence_ids[original_index])
+                request.finished = True
+                paged_cache.release(request.sequence_id)
             else:
                 survivor_local_indices.append(local_index)
+                survivor_requests.append(request)
 
-        if not survivor_local_indices:
+        if not survivor_requests:
             break
 
         if step + 1 < config.max_new_tokens:
-            active_indices = [
-                active_indices[local_index] for local_index in survivor_local_indices
-            ]
+            active_requests = survivor_requests
             active_next_tokens = next_tokens[survivor_local_indices]
             active_sequence_ids = tuple(
-                sequence_ids[original_index] for original_index in active_indices
+                request.sequence_id for request in active_requests
             )
             logits = model(
                 active_next_tokens,
@@ -101,7 +101,15 @@ def paged_greedy_generate(
             last_logits = logits[:, -1]
 
     return RaggedGenerationOutput(
-        sequences=tuple(sequences),
-        generated_tokens=generated_tokens,
-        stopped_by_eos=finished,
+        sequences=tuple(request.sequence for request in requests),
+        generated_tokens=torch.tensor(
+            [request.generated_tokens for request in requests],
+            dtype=torch.long,
+            device=device,
+        ),
+        stopped_by_eos=torch.tensor(
+            [request.finished for request in requests],
+            dtype=torch.bool,
+            device=device,
+        ),
     )

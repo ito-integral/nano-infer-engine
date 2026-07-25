@@ -4,8 +4,19 @@ import torch
 from nano_infer_engine.generation.config import GenerationConfig
 from nano_infer_engine.generation.greedy import greedy_generate
 from nano_infer_engine.generation.paged_greedy import paged_greedy_generate
+from nano_infer_engine.generation.request import PagedRequest
 from nano_infer_engine.models.llama import Llama3_2, LlamaConfig
 from nano_infer_engine.paged_cache import PagedKVCache
+
+
+def test_paged_request_initializes_generation_state() -> None:
+    prompt = torch.tensor([[1, 4]])
+
+    request = PagedRequest(sequence_id="request-a", prompt=prompt)
+
+    assert request.sequence is prompt
+    assert request.generated_tokens == 0
+    assert not request.finished
 
 
 class _ScriptedPagedModel:
