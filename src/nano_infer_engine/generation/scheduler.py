@@ -6,7 +6,7 @@ from nano_infer_engine.paged_cache import PagedKVCache
 
 from .config import GenerationConfig
 from .paged_prefill import _validate_paged_prefill_inputs, paged_prefill
-from .request import PagedRequest
+from .request import PagedRequest, RequestStatus
 
 
 class ContinuousBatchingScheduler:
@@ -89,7 +89,15 @@ class ContinuousBatchingScheduler:
         self._requests[sequence_id] = request
         return request
 
-    def _admit_pending_requests(self) -> None:
+    def _release_request_cache(self, sequence_id: str) -> None:
+        try:
+            self.paged_cache.get_block_table(sequence_id)
+        except KeyError:
+            return
+        self.paged_cache.release(sequence_id)
+
+    def _admit_pending_requests(self) -> list[PagedRequest]:
+        failed_requests: list[PagedRequest] = []
         while (
             self.pending_requests
             and len(self.active_requests) < self.max_batch_size
@@ -102,24 +110,65 @@ class ContinuousBatchingScheduler:
                 break
 
             self.pending_requests.popleft()
-            logits = paged_prefill(
-                self.model,
-                (request.prompt,),
-                self.paged_cache,
-                (request.sequence_id,),
-            )
-            request.last_logits = logits[0]
+            try:
+                logits = paged_prefill(
+                    self.model,
+                    (request.prompt,),
+                    self.paged_cache,
+                    (request.sequence_id,),
+                )
+                request.last_logits = logits[0]
+            except Exception as error:
+                self._release_request_cache(request.sequence_id)
+                request.status = RequestStatus.FAILED
+                request.error = error
+                failed_requests.append(request)
+                continue
+
+            request.status = RequestStatus.ACTIVE
             self.active_requests.append(request)
             self.reserved_blocks += request.required_blocks
+        return failed_requests
+
+    def cancel_request(self, sequence_id: str) -> bool:
+        """Cancel a pending or active request and release its cache blocks."""
+        request = self._requests.get(sequence_id)
+        if request is None:
+            raise KeyError(sequence_id)
+        if request.status not in {
+            RequestStatus.PENDING,
+            RequestStatus.ACTIVE,
+        }:
+            return False
+
+        if request.status is RequestStatus.PENDING:
+            self.pending_requests = deque(
+                pending
+                for pending in self.pending_requests
+                if pending is not request
+            )
+        else:
+            self.active_requests = [
+                active
+                for active in self.active_requests
+                if active is not request
+            ]
+            self.reserved_blocks -= request.required_blocks
+            self._release_request_cache(request.sequence_id)
+
+        request.status = RequestStatus.CANCELLED
+        self.completed_requests.append(request)
+        return True
 
     @torch.inference_mode()
     def step(self) -> tuple[PagedRequest, ...]:
         """Run one generation iteration and return requests completed in it."""
-        self._admit_pending_requests()
+        completed_now = self._admit_pending_requests()
         if not self.active_requests:
             if self.pending_requests:
                 raise RuntimeError("pending requests cannot be admitted")
-            return ()
+            self.completed_requests.extend(completed_now)
+            return tuple(completed_now)
 
         request_logits: list[torch.Tensor] = []
         for request in self.active_requests:
@@ -150,7 +199,6 @@ class ContinuousBatchingScheduler:
                 device=next_tokens.device,
             )
 
-        completed_now: list[PagedRequest] = []
         survivor_indices: list[int] = []
         survivors: list[PagedRequest] = []
         for local_index, request in enumerate(self.active_requests):
@@ -160,9 +208,10 @@ class ContinuousBatchingScheduler:
             )
             if stopped_by_eos or reached_token_limit:
                 request.finished = stopped_by_eos
+                request.status = RequestStatus.COMPLETED
                 self.reserved_blocks -= request.required_blocks
                 if stopped_by_eos or self.release_on_token_limit:
-                    self.paged_cache.release(request.sequence_id)
+                    self._release_request_cache(request.sequence_id)
                 completed_now.append(request)
                 continue
 
@@ -181,8 +230,8 @@ class ContinuousBatchingScheduler:
             for local_index, request in enumerate(survivors):
                 request.last_logits = logits[local_index, -1]
 
+        completed_now.extend(self._admit_pending_requests())
         self.completed_requests.extend(completed_now)
-        self._admit_pending_requests()
         return tuple(completed_now)
 
     def run_until_idle(self) -> tuple[PagedRequest, ...]:

@@ -4,6 +4,7 @@ from nano_infer_engine.paged_cache import PagedKVCache
 
 from .config import GenerationConfig, RaggedGenerationOutput
 from .paged_prefill import _validate_paged_prefill_inputs
+from .request import RequestStatus
 from .scheduler import ContinuousBatchingScheduler
 
 
@@ -61,6 +62,18 @@ def paged_greedy_generate(
         for prompt, sequence_id in zip(prompts, sequence_ids)
     ]
     scheduler.run_until_idle()
+    failed_request = next(
+        (
+            request
+            for request in requests
+            if request.status is RequestStatus.FAILED
+        ),
+        None,
+    )
+    if failed_request is not None:
+        raise RuntimeError(
+            f"paged prefill failed: {failed_request.sequence_id}"
+        ) from failed_request.error
     device = prompts[0].device
 
     return RaggedGenerationOutput(

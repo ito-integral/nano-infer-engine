@@ -4,7 +4,7 @@ import torch
 from nano_infer_engine.generation.config import GenerationConfig
 from nano_infer_engine.generation.greedy import greedy_generate
 from nano_infer_engine.generation.paged_greedy import paged_greedy_generate
-from nano_infer_engine.generation.request import PagedRequest
+from nano_infer_engine.generation.request import PagedRequest, RequestStatus
 from nano_infer_engine.generation.scheduler import ContinuousBatchingScheduler
 from nano_infer_engine.models.llama import Llama3_2, LlamaConfig
 from nano_infer_engine.paged_cache import PagedKVCache
@@ -18,6 +18,8 @@ def test_paged_request_initializes_generation_state() -> None:
     assert request.sequence is prompt
     assert request.generated_tokens == 0
     assert not request.finished
+    assert request.status is RequestStatus.PENDING
+    assert request.error is None
 
 
 class _ScriptedPagedModel:
@@ -67,6 +69,27 @@ class _ScriptedPagedModel:
             logits[batch_index, -1, next_token] = 1.0
 
         return logits
+
+
+class _FailingPrefillModel(_ScriptedPagedModel):
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        kv_cache: PagedKVCache,
+        sequence_id: str = "default",
+        sequence_ids: tuple[str, ...] | None = None,
+    ) -> torch.Tensor:
+        if sequence_ids is None and sequence_id == "request-failed":
+            kv_cache.ensure_capacity(sequence_id, input_ids.shape[1])
+            kv_cache.advance(sequence_id, input_ids.shape[1])
+            raise RuntimeError("prefill failed")
+        return super().__call__(
+            input_ids,
+            kv_cache=kv_cache,
+            sequence_id=sequence_id,
+            sequence_ids=sequence_ids,
+        )
 
 
 def test_paged_greedy_matches_individual_generation_for_ragged_prompts() -> None:
@@ -349,4 +372,93 @@ def test_scheduler_accepts_requests_between_decode_steps() -> None:
         "request-b",
         "request-c",
     ]
+    assert cache.allocator.allocated_block_count == 0
+
+
+def test_scheduler_cleans_up_failed_prefill_and_continues() -> None:
+    eos_token_id = 2
+    model = _FailingPrefillModel(
+        {
+            "request-failed": (3,),
+            "request-ok": (eos_token_id,),
+        }
+    )
+    cache = PagedKVCache(
+        num_blocks=4,
+        block_size=1,
+        num_layers=1,
+        kv_head_num=1,
+        head_dim=1,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    scheduler = ContinuousBatchingScheduler(
+        model,
+        GenerationConfig(
+            max_new_tokens=2,
+            eos_token_id=eos_token_id,
+            use_cache=True,
+        ),
+        cache,
+        max_batch_size=2,
+    )
+    failed_request = scheduler.add_request(
+        "request-failed",
+        torch.tensor([[1]]),
+    )
+    successful_request = scheduler.add_request(
+        "request-ok",
+        torch.tensor([[1]]),
+    )
+
+    completed = scheduler.step()
+
+    assert completed == (failed_request, successful_request)
+    assert failed_request.status is RequestStatus.FAILED
+    assert isinstance(failed_request.error, RuntimeError)
+    assert successful_request.status is RequestStatus.COMPLETED
+    assert not scheduler.has_work
+    assert cache.allocator.allocated_block_count == 0
+
+
+def test_scheduler_cancels_pending_and_active_requests() -> None:
+    model = _ScriptedPagedModel(
+        {
+            "request-active": (3, 4, 5),
+            "request-pending": (6,),
+        }
+    )
+    cache = PagedKVCache(
+        num_blocks=3,
+        block_size=1,
+        num_layers=1,
+        kv_head_num=1,
+        head_dim=1,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    scheduler = ContinuousBatchingScheduler(
+        model,
+        GenerationConfig(max_new_tokens=3, use_cache=True),
+        cache,
+        max_batch_size=1,
+    )
+    active_request = scheduler.add_request(
+        "request-active",
+        torch.tensor([[1]]),
+    )
+    pending_request = scheduler.add_request(
+        "request-pending",
+        torch.tensor([[1]]),
+    )
+    scheduler.step()
+
+    assert scheduler.cancel_request("request-pending")
+    assert scheduler.cancel_request("request-active")
+
+    assert pending_request.status is RequestStatus.CANCELLED
+    assert active_request.status is RequestStatus.CANCELLED
+    assert not scheduler.cancel_request("request-active")
+    assert not scheduler.has_work
+    assert scheduler.reserved_blocks == 0
     assert cache.allocator.allocated_block_count == 0
