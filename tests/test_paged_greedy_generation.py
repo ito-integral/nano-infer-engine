@@ -5,6 +5,7 @@ from nano_infer_engine.generation.config import GenerationConfig
 from nano_infer_engine.generation.greedy import greedy_generate
 from nano_infer_engine.generation.paged_greedy import paged_greedy_generate
 from nano_infer_engine.generation.request import PagedRequest
+from nano_infer_engine.generation.scheduler import ContinuousBatchingScheduler
 from nano_infer_engine.models.llama import Llama3_2, LlamaConfig
 from nano_infer_engine.paged_cache import PagedKVCache
 
@@ -291,4 +292,61 @@ def test_paged_greedy_admits_pending_requests_after_token_limit() -> None:
     ]
     assert torch.equal(output.generated_tokens, torch.tensor([2, 2]))
     assert not output.stopped_by_eos.any()
+    assert cache.allocator.allocated_block_count == 0
+
+
+def test_scheduler_accepts_requests_between_decode_steps() -> None:
+    eos_token_id = 2
+    model = _ScriptedPagedModel(
+        {
+            "request-a": (eos_token_id,),
+            "request-b": (3, eos_token_id),
+            "request-c": (4, eos_token_id),
+        }
+    )
+    cache = PagedKVCache(
+        num_blocks=6,
+        block_size=1,
+        num_layers=1,
+        kv_head_num=1,
+        head_dim=1,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    scheduler = ContinuousBatchingScheduler(
+        model,
+        GenerationConfig(
+            max_new_tokens=3,
+            eos_token_id=eos_token_id,
+            use_cache=True,
+        ),
+        cache,
+        max_batch_size=2,
+    )
+
+    scheduler.add_request("request-a", torch.tensor([[6]]))
+    scheduler.add_request("request-b", torch.tensor([[6]]))
+
+    assert scheduler.pending_count == 2
+    assert scheduler.active_count == 0
+    assert tuple(
+        request.sequence_id for request in scheduler.step()
+    ) == ("request-a",)
+
+    scheduler.add_request("request-c", torch.tensor([[6]]))
+
+    assert scheduler.pending_count == 1
+    assert scheduler.active_count == 1
+    assert tuple(
+        request.sequence_id for request in scheduler.step()
+    ) == ("request-b",)
+    assert tuple(
+        request.sequence_id for request in scheduler.step()
+    ) == ("request-c",)
+    assert not scheduler.has_work
+    assert model.prefill_sequence_ids == [
+        "request-a",
+        "request-b",
+        "request-c",
+    ]
     assert cache.allocator.allocated_block_count == 0

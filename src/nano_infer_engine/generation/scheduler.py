@@ -1,0 +1,193 @@
+from collections import deque
+
+import torch
+
+from nano_infer_engine.paged_cache import PagedKVCache
+
+from .config import GenerationConfig
+from .paged_prefill import _validate_paged_prefill_inputs, paged_prefill
+from .request import PagedRequest
+
+
+class ContinuousBatchingScheduler:
+    """Schedule dynamically submitted requests over a shared paged KV cache."""
+
+    def __init__(
+        self,
+        model,
+        config: GenerationConfig,
+        paged_cache: PagedKVCache,
+        max_batch_size: int,
+        *,
+        release_on_token_limit: bool = True,
+    ) -> None:
+        if not config.use_cache:
+            raise ValueError("continuous batching requires config.use_cache=True")
+        if (
+            isinstance(max_batch_size, bool)
+            or not isinstance(max_batch_size, int)
+            or max_batch_size <= 0
+        ):
+            raise ValueError("max_batch_size must be a positive integer")
+        if not isinstance(paged_cache, PagedKVCache):
+            raise TypeError("paged_cache must be a PagedKVCache")
+
+        self.model = model
+        self.config = config
+        self.paged_cache = paged_cache
+        self.max_batch_size = max_batch_size
+        self.release_on_token_limit = release_on_token_limit
+        self.block_budget = paged_cache.allocator.free_block_count
+
+        self.pending_requests: deque[PagedRequest] = deque()
+        self.active_requests: list[PagedRequest] = []
+        self.completed_requests: list[PagedRequest] = []
+        self.reserved_blocks = 0
+        self._requests: dict[str, PagedRequest] = {}
+
+    @property
+    def has_work(self) -> bool:
+        """Return whether pending or active requests remain."""
+        return bool(self.pending_requests or self.active_requests)
+
+    @property
+    def pending_count(self) -> int:
+        return len(self.pending_requests)
+
+    @property
+    def active_count(self) -> int:
+        return len(self.active_requests)
+
+    def add_request(self, sequence_id: str, prompt: torch.Tensor) -> PagedRequest:
+        """Submit a request to the FIFO pending queue."""
+        if sequence_id in self._requests:
+            raise ValueError(f"sequence ID already submitted: {sequence_id}")
+
+        _validate_paged_prefill_inputs(
+            (prompt,),
+            self.paged_cache,
+            (sequence_id,),
+        )
+        required_blocks = (
+            prompt.shape[1]
+            + self.config.max_new_tokens
+            - 1
+            + self.paged_cache.block_size
+            - 1
+        ) // self.paged_cache.block_size
+        if required_blocks > self.block_budget:
+            raise ValueError(
+                f"request cannot fit in paged cache: {sequence_id}"
+            )
+
+        request = PagedRequest(
+            sequence_id=sequence_id,
+            prompt=prompt,
+            required_blocks=required_blocks,
+        )
+        self.pending_requests.append(request)
+        self._requests[sequence_id] = request
+        return request
+
+    def _admit_pending_requests(self) -> None:
+        while (
+            self.pending_requests
+            and len(self.active_requests) < self.max_batch_size
+        ):
+            request = self.pending_requests[0]
+            if (
+                self.reserved_blocks + request.required_blocks
+                > self.block_budget
+            ):
+                break
+
+            self.pending_requests.popleft()
+            logits = paged_prefill(
+                self.model,
+                (request.prompt,),
+                self.paged_cache,
+                (request.sequence_id,),
+            )
+            request.last_logits = logits[0]
+            self.active_requests.append(request)
+            self.reserved_blocks += request.required_blocks
+
+    @torch.inference_mode()
+    def step(self) -> tuple[PagedRequest, ...]:
+        """Run one generation iteration and return requests completed in it."""
+        self._admit_pending_requests()
+        if not self.active_requests:
+            if self.pending_requests:
+                raise RuntimeError("pending requests cannot be admitted")
+            return ()
+
+        request_logits: list[torch.Tensor] = []
+        for request in self.active_requests:
+            if request.last_logits is None:
+                raise RuntimeError("active request is missing logits")
+            request_logits.append(request.last_logits)
+        last_logits = torch.stack(request_logits)
+        next_tokens = last_logits.argmax(dim=-1, keepdim=True)
+
+        for local_index, request in enumerate(self.active_requests):
+            request.generated_tokens += 1
+            request.sequence = torch.cat(
+                (
+                    request.sequence,
+                    next_tokens[local_index : local_index + 1],
+                ),
+                dim=1,
+            )
+
+        if self.config.eos_token_id is not None:
+            finished_now = next_tokens.squeeze(-1).eq(
+                self.config.eos_token_id
+            )
+        else:
+            finished_now = torch.zeros(
+                len(self.active_requests),
+                dtype=torch.bool,
+                device=next_tokens.device,
+            )
+
+        completed_now: list[PagedRequest] = []
+        survivor_indices: list[int] = []
+        survivors: list[PagedRequest] = []
+        for local_index, request in enumerate(self.active_requests):
+            stopped_by_eos = bool(finished_now[local_index])
+            reached_token_limit = (
+                request.generated_tokens >= self.config.max_new_tokens
+            )
+            if stopped_by_eos or reached_token_limit:
+                request.finished = stopped_by_eos
+                self.reserved_blocks -= request.required_blocks
+                if stopped_by_eos or self.release_on_token_limit:
+                    self.paged_cache.release(request.sequence_id)
+                completed_now.append(request)
+                continue
+
+            survivor_indices.append(local_index)
+            survivors.append(request)
+
+        self.active_requests = survivors
+        if survivors:
+            logits = self.model(
+                next_tokens[survivor_indices],
+                kv_cache=self.paged_cache,
+                sequence_ids=tuple(
+                    request.sequence_id for request in survivors
+                ),
+            )
+            for local_index, request in enumerate(survivors):
+                request.last_logits = logits[local_index, -1]
+
+        self.completed_requests.extend(completed_now)
+        self._admit_pending_requests()
+        return tuple(completed_now)
+
+    def run_until_idle(self) -> tuple[PagedRequest, ...]:
+        """Run steps until every currently submitted request completes."""
+        completed: list[PagedRequest] = []
+        while self.has_work:
+            completed.extend(self.step())
+        return tuple(completed)
