@@ -44,6 +44,7 @@ class ContinuousBatchingScheduler:
         self.completed_requests: list[PagedRequest] = []
         self.reserved_blocks = 0
         self._requests: dict[str, PagedRequest] = {}
+        self._closed = False
 
     @property
     def has_work(self) -> bool:
@@ -58,8 +59,14 @@ class ContinuousBatchingScheduler:
     def active_count(self) -> int:
         return len(self.active_requests)
 
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
     def add_request(self, sequence_id: str, prompt: torch.Tensor) -> PagedRequest:
         """Submit a request to the FIFO pending queue."""
+        if self._closed:
+            raise RuntimeError("scheduler is closed")
         if sequence_id in self._requests:
             raise ValueError(f"sequence ID already submitted: {sequence_id}")
 
@@ -160,9 +167,31 @@ class ContinuousBatchingScheduler:
         self.completed_requests.append(request)
         return True
 
+    def close(self) -> tuple[PagedRequest, ...]:
+        """Cancel unfinished requests and release all scheduler-owned cache."""
+        if self._closed:
+            return ()
+
+        self._closed = True
+        cancelled_requests: list[PagedRequest] = []
+        for request in (*self.pending_requests, *self.active_requests):
+            request.status = RequestStatus.CANCELLED
+            cancelled_requests.append(request)
+
+        for request in self._requests.values():
+            self._release_request_cache(request.sequence_id)
+
+        self.pending_requests.clear()
+        self.active_requests.clear()
+        self.reserved_blocks = 0
+        self.completed_requests.extend(cancelled_requests)
+        return tuple(cancelled_requests)
+
     @torch.inference_mode()
     def step(self) -> tuple[PagedRequest, ...]:
         """Run one generation iteration and return requests completed in it."""
+        if self._closed:
+            raise RuntimeError("scheduler is closed")
         completed_now = self._admit_pending_requests()
         if not self.active_requests:
             if self.pending_requests:
@@ -220,15 +249,24 @@ class ContinuousBatchingScheduler:
 
         self.active_requests = survivors
         if survivors:
-            logits = self.model(
-                next_tokens[survivor_indices],
-                kv_cache=self.paged_cache,
-                sequence_ids=tuple(
-                    request.sequence_id for request in survivors
-                ),
-            )
-            for local_index, request in enumerate(survivors):
-                request.last_logits = logits[local_index, -1]
+            try:
+                logits = self.model(
+                    next_tokens[survivor_indices],
+                    kv_cache=self.paged_cache,
+                    sequence_ids=tuple(
+                        request.sequence_id for request in survivors
+                    ),
+                )
+                for local_index, request in enumerate(survivors):
+                    request.last_logits = logits[local_index, -1]
+            except Exception as error:
+                for request in survivors:
+                    request.status = RequestStatus.FAILED
+                    request.error = error
+                    self.reserved_blocks -= request.required_blocks
+                    self._release_request_cache(request.sequence_id)
+                    completed_now.append(request)
+                self.active_requests = []
 
         completed_now.extend(self._admit_pending_requests())
         self.completed_requests.extend(completed_now)

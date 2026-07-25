@@ -92,6 +92,34 @@ class _FailingPrefillModel(_ScriptedPagedModel):
         )
 
 
+class _FailingDecodeModel(_ScriptedPagedModel):
+    def __init__(
+        self,
+        token_schedules: dict[str, tuple[int, ...]],
+        failing_sequence_ids: tuple[str, ...],
+    ) -> None:
+        super().__init__(token_schedules)
+        self.failing_sequence_ids = failing_sequence_ids
+
+    def __call__(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        kv_cache: PagedKVCache,
+        sequence_id: str = "default",
+        sequence_ids: tuple[str, ...] | None = None,
+    ) -> torch.Tensor:
+        logits = super().__call__(
+            input_ids,
+            kv_cache=kv_cache,
+            sequence_id=sequence_id,
+            sequence_ids=sequence_ids,
+        )
+        if sequence_ids == self.failing_sequence_ids:
+            raise RuntimeError("decode failed")
+        return logits
+
+
 def test_paged_greedy_matches_individual_generation_for_ragged_prompts() -> None:
     torch.manual_seed(0)
     model = Llama3_2(
@@ -461,4 +489,135 @@ def test_scheduler_cancels_pending_and_active_requests() -> None:
     assert not scheduler.cancel_request("request-active")
     assert not scheduler.has_work
     assert scheduler.reserved_blocks == 0
+    assert cache.allocator.allocated_block_count == 0
+
+
+def test_scheduler_cleans_up_failed_decode_and_continues() -> None:
+    eos_token_id = 2
+    model = _FailingDecodeModel(
+        {
+            "request-a": (3, 4),
+            "request-b": (5, 6),
+            "request-c": (eos_token_id,),
+        },
+        failing_sequence_ids=("request-a", "request-b"),
+    )
+    cache = PagedKVCache(
+        num_blocks=6,
+        block_size=1,
+        num_layers=1,
+        kv_head_num=1,
+        head_dim=1,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    scheduler = ContinuousBatchingScheduler(
+        model,
+        GenerationConfig(
+            max_new_tokens=3,
+            eos_token_id=eos_token_id,
+            use_cache=True,
+        ),
+        cache,
+        max_batch_size=2,
+    )
+    request_a = scheduler.add_request("request-a", torch.tensor([[1]]))
+    request_b = scheduler.add_request("request-b", torch.tensor([[1]]))
+    request_c = scheduler.add_request("request-c", torch.tensor([[1]]))
+
+    failed_requests = scheduler.step()
+
+    assert failed_requests == (request_a, request_b)
+    assert all(
+        request.status is RequestStatus.FAILED
+        for request in failed_requests
+    )
+    assert all(
+        isinstance(request.error, RuntimeError)
+        for request in failed_requests
+    )
+    assert scheduler.active_count == 1
+    assert scheduler.pending_count == 0
+    assert scheduler.reserved_blocks == request_c.required_blocks
+
+    assert scheduler.step() == (request_c,)
+    assert request_c.status is RequestStatus.COMPLETED
+    assert not scheduler.has_work
+    assert scheduler.reserved_blocks == 0
+    assert cache.allocator.allocated_block_count == 0
+
+
+def test_scheduler_close_cancels_work_and_is_idempotent() -> None:
+    model = _ScriptedPagedModel(
+        {
+            "request-active": (3, 4, 5),
+            "request-pending": (6,),
+        }
+    )
+    cache = PagedKVCache(
+        num_blocks=3,
+        block_size=1,
+        num_layers=1,
+        kv_head_num=1,
+        head_dim=1,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    scheduler = ContinuousBatchingScheduler(
+        model,
+        GenerationConfig(max_new_tokens=3, use_cache=True),
+        cache,
+        max_batch_size=1,
+    )
+    active_request = scheduler.add_request(
+        "request-active",
+        torch.tensor([[1]]),
+    )
+    pending_request = scheduler.add_request(
+        "request-pending",
+        torch.tensor([[1]]),
+    )
+    scheduler.step()
+
+    assert scheduler.close() == (pending_request, active_request)
+    assert active_request.status is RequestStatus.CANCELLED
+    assert pending_request.status is RequestStatus.CANCELLED
+    assert scheduler.is_closed
+    assert not scheduler.has_work
+    assert scheduler.reserved_blocks == 0
+    assert cache.allocator.allocated_block_count == 0
+    assert scheduler.close() == ()
+
+    with pytest.raises(RuntimeError, match="scheduler is closed"):
+        scheduler.step()
+    with pytest.raises(RuntimeError, match="scheduler is closed"):
+        scheduler.add_request("request-new", torch.tensor([[1]]))
+
+
+def test_scheduler_close_releases_retained_completed_cache() -> None:
+    model = _ScriptedPagedModel({"request-a": (3,)})
+    cache = PagedKVCache(
+        num_blocks=1,
+        block_size=1,
+        num_layers=1,
+        kv_head_num=1,
+        head_dim=1,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    scheduler = ContinuousBatchingScheduler(
+        model,
+        GenerationConfig(max_new_tokens=1, use_cache=True),
+        cache,
+        max_batch_size=1,
+        release_on_token_limit=False,
+    )
+    request = scheduler.add_request("request-a", torch.tensor([[1]]))
+
+    assert scheduler.step() == (request,)
+    assert request.status is RequestStatus.COMPLETED
+    assert cache.allocator.allocated_block_count == 1
+
+    assert scheduler.close() == ()
+    assert request.status is RequestStatus.COMPLETED
     assert cache.allocator.allocated_block_count == 0
