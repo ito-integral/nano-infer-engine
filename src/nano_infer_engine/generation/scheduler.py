@@ -60,6 +60,13 @@ class ContinuousBatchingScheduler:
     def active_count(self) -> int:
         return len(self.active_requests)
 
+    def get_request(self, sequence_id: str) -> PagedRequest:
+        """Return request state owned by this scheduler."""
+        try:
+            return self._requests[sequence_id]
+        except KeyError:
+            raise KeyError(sequence_id) from None
+
     @property
     def is_closed(self) -> bool:
         return self._closed

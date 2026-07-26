@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 
-from .request import PagedRequest
+import torch
+
+from .request import PagedRequest, RequestStatus
 
 
 @dataclass(frozen=True)
@@ -17,3 +19,15 @@ class SchedulerStepOutput:
 
     token_events: tuple[TokenEvent, ...]
     terminal_requests: tuple[PagedRequest, ...]
+
+
+@dataclass(frozen=True)
+class RequestResult:
+    """Immutable terminal result exposed by the asynchronous engine."""
+
+    sequence_id: str
+    status: RequestStatus
+    sequence: torch.Tensor
+    generated_tokens: int
+    stopped_by_eos: bool
+    error: Exception | None
