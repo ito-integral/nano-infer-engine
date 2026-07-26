@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from nano_infer_engine.generation.config import GenerationConfig
+from nano_infer_engine.generation.events import TokenEvent
 from nano_infer_engine.generation.greedy import greedy_generate
 from nano_infer_engine.generation.paged_greedy import paged_greedy_generate
 from nano_infer_engine.generation.request import PagedRequest, RequestStatus
@@ -380,8 +381,13 @@ def test_scheduler_accepts_requests_between_decode_steps() -> None:
 
     assert scheduler.pending_count == 2
     assert scheduler.active_count == 0
+    step_output = scheduler.step()
+    assert step_output.token_events == (
+        TokenEvent("request-a", eos_token_id),
+        TokenEvent("request-b", 3),
+    )
     assert tuple(
-        request.sequence_id for request in scheduler.step()
+        request.sequence_id for request in step_output.terminal_requests
     ) == ("request-a",)
 
     scheduler.add_request("request-c", torch.tensor([[6]]))
@@ -389,10 +395,12 @@ def test_scheduler_accepts_requests_between_decode_steps() -> None:
     assert scheduler.pending_count == 1
     assert scheduler.active_count == 1
     assert tuple(
-        request.sequence_id for request in scheduler.step()
+        request.sequence_id
+        for request in scheduler.step().terminal_requests
     ) == ("request-b",)
     assert tuple(
-        request.sequence_id for request in scheduler.step()
+        request.sequence_id
+        for request in scheduler.step().terminal_requests
     ) == ("request-c",)
     assert not scheduler.has_work
     assert model.prefill_sequence_ids == [
@@ -401,6 +409,48 @@ def test_scheduler_accepts_requests_between_decode_steps() -> None:
         "request-c",
     ]
     assert cache.allocator.allocated_block_count == 0
+
+
+def test_scheduler_emits_each_generated_token_once() -> None:
+    eos_token_id = 2
+    model = _ScriptedPagedModel(
+        {"request-a": (3, 4, eos_token_id)}
+    )
+    cache = PagedKVCache(
+        num_blocks=3,
+        block_size=1,
+        num_layers=1,
+        kv_head_num=1,
+        head_dim=1,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    scheduler = ContinuousBatchingScheduler(
+        model,
+        GenerationConfig(
+            max_new_tokens=3,
+            eos_token_id=eos_token_id,
+            use_cache=True,
+        ),
+        cache,
+        max_batch_size=1,
+    )
+    request = scheduler.add_request("request-a", torch.tensor([[1]]))
+    token_events: list[TokenEvent] = []
+    terminal_requests: list[PagedRequest] = []
+
+    while scheduler.has_work:
+        step_output = scheduler.step()
+        token_events.extend(step_output.token_events)
+        terminal_requests.extend(step_output.terminal_requests)
+
+    assert token_events == [
+        TokenEvent("request-a", 3),
+        TokenEvent("request-a", 4),
+        TokenEvent("request-a", eos_token_id),
+    ]
+    assert terminal_requests == [request]
+    assert torch.equal(request.sequence, torch.tensor([[1, 3, 4, 2]]))
 
 
 def test_scheduler_cleans_up_failed_prefill_and_continues() -> None:
@@ -439,9 +489,15 @@ def test_scheduler_cleans_up_failed_prefill_and_continues() -> None:
         torch.tensor([[1]]),
     )
 
-    completed = scheduler.step()
+    step_output = scheduler.step()
 
-    assert completed == (failed_request, successful_request)
+    assert step_output.token_events == (
+        TokenEvent("request-ok", eos_token_id),
+    )
+    assert step_output.terminal_requests == (
+        failed_request,
+        successful_request,
+    )
     assert failed_request.status is RequestStatus.FAILED
     assert isinstance(failed_request.error, RuntimeError)
     assert successful_request.status is RequestStatus.COMPLETED
@@ -525,8 +581,13 @@ def test_scheduler_cleans_up_failed_decode_and_continues() -> None:
     request_b = scheduler.add_request("request-b", torch.tensor([[1]]))
     request_c = scheduler.add_request("request-c", torch.tensor([[1]]))
 
-    failed_requests = scheduler.step()
+    step_output = scheduler.step()
+    failed_requests = step_output.terminal_requests
 
+    assert step_output.token_events == (
+        TokenEvent("request-a", 3),
+        TokenEvent("request-b", 5),
+    )
     assert failed_requests == (request_a, request_b)
     assert all(
         request.status is RequestStatus.FAILED
@@ -540,7 +601,11 @@ def test_scheduler_cleans_up_failed_decode_and_continues() -> None:
     assert scheduler.pending_count == 0
     assert scheduler.reserved_blocks == request_c.required_blocks
 
-    assert scheduler.step() == (request_c,)
+    step_output = scheduler.step()
+    assert step_output.token_events == (
+        TokenEvent("request-c", eos_token_id),
+    )
+    assert step_output.terminal_requests == (request_c,)
     assert request_c.status is RequestStatus.COMPLETED
     assert not scheduler.has_work
     assert scheduler.reserved_blocks == 0
@@ -614,7 +679,9 @@ def test_scheduler_close_releases_retained_completed_cache() -> None:
     )
     request = scheduler.add_request("request-a", torch.tensor([[1]]))
 
-    assert scheduler.step() == (request,)
+    step_output = scheduler.step()
+    assert step_output.token_events == (TokenEvent("request-a", 3),)
+    assert step_output.terminal_requests == (request,)
     assert request.status is RequestStatus.COMPLETED
     assert cache.allocator.allocated_block_count == 1
 

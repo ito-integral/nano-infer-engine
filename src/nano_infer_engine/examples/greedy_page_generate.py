@@ -94,13 +94,18 @@ print(
 step = 0
 while scheduler.has_work:
     step += 1
-    terminal_requests = scheduler.step()
+    step_output = scheduler.step()
     if step == 1:
         print(
             f"after admission: active={scheduler.active_count}, "
             f"pending={scheduler.pending_count}"
         )
-    for request in terminal_requests:
+    for event in step_output.token_events:
+        print(
+            f"step={step}, sequence_id={event.sequence_id}, "
+            f"token_id={event.token_id}"
+        )
+    for request in step_output.terminal_requests:
         print(
             f"step={step}, sequence_id={request.sequence_id}, "
             f"status={request.status.value}"

@@ -5,6 +5,7 @@ import torch
 from nano_infer_engine.paged_cache import PagedKVCache
 
 from .config import GenerationConfig
+from .events import SchedulerStepOutput, TokenEvent
 from .paged_prefill import _validate_paged_prefill_inputs, paged_prefill
 from .request import PagedRequest, RequestStatus
 
@@ -188,8 +189,8 @@ class ContinuousBatchingScheduler:
         return tuple(cancelled_requests)
 
     @torch.inference_mode()
-    def step(self) -> tuple[PagedRequest, ...]:
-        """Run one generation iteration and return requests completed in it."""
+    def step(self) -> SchedulerStepOutput:
+        """Run one iteration and return its tokens and terminal requests."""
         if self._closed:
             raise RuntimeError("scheduler is closed")
         completed_now = self._admit_pending_requests()
@@ -197,7 +198,7 @@ class ContinuousBatchingScheduler:
             if self.pending_requests:
                 raise RuntimeError("pending requests cannot be admitted")
             self.completed_requests.extend(completed_now)
-            return tuple(completed_now)
+            return SchedulerStepOutput((), tuple(completed_now))
 
         request_logits: list[torch.Tensor] = []
         for request in self.active_requests:
@@ -206,6 +207,14 @@ class ContinuousBatchingScheduler:
             request_logits.append(request.last_logits)
         last_logits = torch.stack(request_logits)
         next_tokens = last_logits.argmax(dim=-1, keepdim=True)
+        next_token_ids = next_tokens.squeeze(-1).tolist()
+        token_events = tuple(
+            TokenEvent(
+                sequence_id=request.sequence_id,
+                token_id=next_token_ids[local_index],
+            )
+            for local_index, request in enumerate(self.active_requests)
+        )
 
         for local_index, request in enumerate(self.active_requests):
             request.generated_tokens += 1
@@ -270,11 +279,11 @@ class ContinuousBatchingScheduler:
 
         completed_now.extend(self._admit_pending_requests())
         self.completed_requests.extend(completed_now)
-        return tuple(completed_now)
+        return SchedulerStepOutput(token_events, tuple(completed_now))
 
     def run_until_idle(self) -> tuple[PagedRequest, ...]:
         """Run steps until every currently submitted request completes."""
         completed: list[PagedRequest] = []
         while self.has_work:
-            completed.extend(self.step())
+            completed.extend(self.step().terminal_requests)
         return tuple(completed)
