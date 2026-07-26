@@ -8,10 +8,12 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.140.0",
     "numpy>=2.4.4",
     "safetensors>=0.8.0",
     "torch==2.11.0",
     "transformers>=4.45,<5",
+    "uvicorn>=0.51.0",
 ]
 
 [build-system]
@@ -20,6 +22,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pytest>=9.1.1",
     "ruff>=0.15.22",
 ]
