@@ -204,6 +204,21 @@ def test_pd_scheduler_close_cancels_pending_and_active_requests() -> None:
     assert scheduler.close() == ()
 
 
+def test_pd_scheduler_rejects_request_over_max_model_len() -> None:
+    scheduler = _build_scheduler(
+        GenerationConfig(
+            max_new_tokens=3,
+            eos_token_id=None,
+            use_cache=True,
+        )
+    )
+    scheduler.prefill_model.config.max_seq_len = 4
+    scheduler.decode_model.config.max_seq_len = 4
+
+    with pytest.raises(ValueError, match="exceeds max model length"):
+        scheduler.add_request("request-a", torch.tensor([[1, 3]]))
+
+
 @pytest.mark.skipif(
     torch.cuda.device_count() < 2,
     reason="requires at least two CUDA devices",

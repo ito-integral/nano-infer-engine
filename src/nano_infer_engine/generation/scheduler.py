@@ -87,6 +87,14 @@ class ContinuousBatchingScheduler:
             self.paged_cache,
             (sequence_id,),
         )
+        model_config = getattr(self.model, "config", None)
+        max_model_len = getattr(model_config, "max_seq_len", None)
+        if max_model_len is not None and (
+            prompt.shape[1] + self.config.max_new_tokens > max_model_len
+        ):
+            raise ValueError(
+                f"request exceeds max model length: {sequence_id}"
+            )
         required_blocks = (
             prompt.shape[1]
             + self.config.max_new_tokens

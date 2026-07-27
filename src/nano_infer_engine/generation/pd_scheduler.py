@@ -97,6 +97,14 @@ class PDContinuousBatchingScheduler:
         else:
             raise ValueError(f"sequence ID already exists: {sequence_id}")
 
+        if (
+            prompt.shape[1] + self.config.max_new_tokens
+            > self.decode_model.config.max_seq_len
+        ):
+            raise ValueError(
+                f"request exceeds max model length: {sequence_id}"
+            )
+
         required_blocks = (
             prompt.shape[1]
             + self.config.max_new_tokens

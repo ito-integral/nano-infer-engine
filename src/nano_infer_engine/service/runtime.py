@@ -10,13 +10,31 @@ from nano_infer_engine.generation.async_engine import (
 )
 from nano_infer_engine.generation.config import GenerationConfig
 from nano_infer_engine.loaders.llama import load_convert_hf_config, load_llama
-from nano_infer_engine.models.llama import Llama3_2
+from nano_infer_engine.models.llama import Llama3_2, LlamaConfig
 from nano_infer_engine.paged_cache import PagedKVCache
 
 from .app import InferenceRuntime
 
 
 DEFAULT_MODEL_PATH = "/home/a/dm/models/Llama-3.2-1B-Instruct"
+
+
+def _apply_max_model_len(model_config: LlamaConfig) -> None:
+    configured_value = os.getenv("NANO_MAX_MODEL_LEN")
+    if configured_value is None:
+        return
+    try:
+        max_model_len = int(configured_value)
+    except ValueError:
+        raise ValueError("NANO_MAX_MODEL_LEN must be an integer") from None
+    if max_model_len <= 0:
+        raise ValueError("NANO_MAX_MODEL_LEN must be positive")
+    if max_model_len > model_config.max_seq_len:
+        raise ValueError(
+            "NANO_MAX_MODEL_LEN cannot exceed the model's "
+            f"max_position_embeddings ({model_config.max_seq_len})"
+        )
+    model_config.max_seq_len = max_model_len
 
 
 def _load_model(
@@ -63,6 +81,7 @@ def build_default_runtime() -> InferenceRuntime:
     max_new_tokens = int(os.getenv("NANO_MAX_NEW_TOKENS", "128"))
 
     model_config = load_convert_hf_config(model_path)
+    _apply_max_model_len(model_config)
     model = _load_model(model_config, model_path, dtype, device)
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
@@ -117,6 +136,7 @@ def build_pd_runtime() -> InferenceRuntime:
     max_new_tokens = int(os.getenv("NANO_MAX_NEW_TOKENS", "128"))
 
     model_config = load_convert_hf_config(model_path)
+    _apply_max_model_len(model_config)
     prefill_model = _load_model(
         model_config,
         model_path,
