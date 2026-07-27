@@ -65,6 +65,10 @@ class PDContinuousBatchingScheduler:
         return self.decode_scheduler.active_count
 
     @property
+    def free_block_count(self) -> int:
+        return self.decode_cache.allocator.free_block_count
+
+    @property
     def is_closed(self) -> bool:
         return self._closed
 

@@ -7,7 +7,10 @@ import torch
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from nano_infer_engine.generation.async_engine import AsyncInferenceEngine
+from nano_infer_engine.generation.async_engine import (
+    AsyncInferenceEngine,
+    AsyncPDInferenceEngine,
+)
 from nano_infer_engine.generation.request import RequestStatus
 
 
@@ -15,7 +18,7 @@ from nano_infer_engine.generation.request import RequestStatus
 class InferenceRuntime:
     """Process-wide objects shared by every HTTP request."""
 
-    engine: AsyncInferenceEngine
+    engine: AsyncInferenceEngine | AsyncPDInferenceEngine
     tokenizer: Any
     device: torch.device
 
@@ -77,7 +80,7 @@ def create_app(
             engine_closed=runtime.engine.is_closed,
             pending_requests=scheduler.pending_count,
             active_requests=scheduler.active_count,
-            free_blocks=scheduler.paged_cache.allocator.free_block_count,
+            free_blocks=scheduler.free_block_count,
         )
 
     @app.post("/generate", response_model=GenerateResponse)

@@ -60,6 +60,10 @@ class ContinuousBatchingScheduler:
     def active_count(self) -> int:
         return len(self.active_requests)
 
+    @property
+    def free_block_count(self) -> int:
+        return self.paged_cache.allocator.free_block_count
+
     def get_request(self, sequence_id: str) -> PagedRequest:
         """Return request state owned by this scheduler."""
         try:

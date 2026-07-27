@@ -9,6 +9,7 @@ from nano_infer_engine.paged_cache import PagedKVCache
 
 from .config import GenerationConfig
 from .events import RequestResult, SchedulerStepOutput, TokenEvent
+from .pd_scheduler import PDContinuousBatchingScheduler
 from .request import PagedRequest
 from .scheduler import ContinuousBatchingScheduler
 
@@ -83,17 +84,26 @@ class AsyncInferenceEngine:
         paged_cache: PagedKVCache,
         max_batch_size: int,
     ) -> None:
-        self.scheduler = ContinuousBatchingScheduler(
+        scheduler = ContinuousBatchingScheduler(
             model,
             config,
             paged_cache,
             max_batch_size,
         )
+        self._initialize(scheduler, paged_cache.keys.device.type == "cuda")
+
+    def _initialize(
+        self,
+        scheduler: ContinuousBatchingScheduler
+        | PDContinuousBatchingScheduler,
+        use_executor: bool,
+    ) -> None:
+        self.scheduler = scheduler
         self._handles: dict[str, AsyncRequestHandle] = {}
         self._scheduler_lock = asyncio.Lock()
         self._work_available = asyncio.Event()
         self._executor: ThreadPoolExecutor | None = None
-        self._use_executor = paged_cache.keys.device.type == "cuda"
+        self._use_executor = use_executor
         self._worker_task: asyncio.Task[None] | None = None
         self._closed = False
 
@@ -227,3 +237,30 @@ class AsyncInferenceEngine:
             handle._finish_with_error(error)
         self._handles.clear()
         self._closed = True
+
+
+class AsyncPDInferenceEngine(AsyncInferenceEngine):
+    """Run a P/D continuous-batching scheduler behind asynchronous APIs."""
+
+    def __init__(
+        self,
+        prefill_model,
+        decode_model,
+        config: GenerationConfig,
+        prefill_cache: PagedKVCache,
+        decode_cache: PagedKVCache,
+        max_batch_size: int,
+    ) -> None:
+        scheduler = PDContinuousBatchingScheduler(
+            prefill_model,
+            decode_model,
+            config,
+            prefill_cache,
+            decode_cache,
+            max_batch_size,
+        )
+        use_executor = (
+            prefill_cache.keys.device.type == "cuda"
+            or decode_cache.keys.device.type == "cuda"
+        )
+        self._initialize(scheduler, use_executor)

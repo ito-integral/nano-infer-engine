@@ -2,10 +2,14 @@ import asyncio
 
 import torch
 
-from nano_infer_engine.generation.async_engine import AsyncInferenceEngine
+from nano_infer_engine.generation.async_engine import (
+    AsyncInferenceEngine,
+    AsyncPDInferenceEngine,
+)
 from nano_infer_engine.generation.config import GenerationConfig
 from nano_infer_engine.generation.events import RequestResult, TokenEvent
 from nano_infer_engine.generation.request import RequestStatus
+from nano_infer_engine.models.llama import Llama3_2, LlamaConfig
 from nano_infer_engine.paged_cache import PagedKVCache
 
 
@@ -92,6 +96,61 @@ def _build_engine(
     return engine, cache
 
 
+def _build_zero_model() -> Llama3_2:
+    model = Llama3_2(
+        LlamaConfig(
+            vocab_size=8,
+            hidden_size=8,
+            mlp_inner_size=16,
+            num_layers=1,
+            q_head_num=2,
+            kv_head_num=1,
+            rope_type="default",
+            max_seq_len=16,
+            tie_word_embeddings=False,
+        )
+    ).eval()
+    for parameter in model.parameters():
+        parameter.data.zero_()
+    return model
+
+
+def _build_pd_engine() -> tuple[
+    AsyncPDInferenceEngine,
+    PagedKVCache,
+    PagedKVCache,
+]:
+    prefill_model = _build_zero_model()
+    decode_model = _build_zero_model()
+
+    def build_cache() -> PagedKVCache:
+        return PagedKVCache(
+            num_blocks=8,
+            block_size=1,
+            num_layers=1,
+            kv_head_num=1,
+            head_dim=4,
+            dtype=torch.float32,
+            device="cpu",
+        )
+
+    prefill_cache = build_cache()
+    decode_cache = build_cache()
+    engine = AsyncPDInferenceEngine(
+        prefill_model,
+        decode_model,
+        GenerationConfig(
+            max_new_tokens=4,
+            eos_token_id=None,
+            use_cache=True,
+        ),
+        prefill_cache,
+        decode_cache,
+        max_batch_size=1,
+    )
+    return engine, prefill_cache, decode_cache
+
+
 async def _collect_tokens(handle) -> tuple[list[TokenEvent], RequestResult]:
     events = [event async for event in handle]
     return events, await handle.result()
@@ -141,6 +200,41 @@ def test_async_engine_streams_events_to_each_request() -> None:
         await engine.close()
         assert engine.is_closed
         assert cache.allocator.allocated_block_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_async_pd_engine_accepts_request_while_decode_is_active() -> None:
+    async def scenario() -> None:
+        engine, prefill_cache, decode_cache = _build_pd_engine()
+        handle_a = await engine.submit(
+            torch.tensor([[1, 3]]),
+            sequence_id="request-a",
+        )
+
+        first_event = await anext(handle_a)
+        assert first_event == TokenEvent("request-a", 0)
+        assert engine.scheduler.active_count == 1
+
+        handle_b = await engine.submit(
+            torch.tensor([[1, 4]]),
+            sequence_id="request-b",
+        )
+        assert engine.scheduler.pending_count == 1
+
+        remaining_a, result_a = await _collect_tokens(handle_a)
+        events_b, result_b = await _collect_tokens(handle_b)
+
+        assert remaining_a == [TokenEvent("request-a", 0)] * 3
+        assert events_b == [TokenEvent("request-b", 0)] * 4
+        assert result_a.status is RequestStatus.COMPLETED
+        assert result_b.status is RequestStatus.COMPLETED
+        assert result_a.sequence.device == torch.device("cpu")
+        assert result_b.sequence.device == torch.device("cpu")
+
+        await engine.close()
+        assert prefill_cache.allocator.allocated_block_count == 0
+        assert decode_cache.allocator.allocated_block_count == 0
 
     asyncio.run(scenario())
 

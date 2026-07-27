@@ -4,8 +4,12 @@ from types import SimpleNamespace
 import httpx
 import torch
 
-from nano_infer_engine.generation.async_engine import AsyncInferenceEngine
+from nano_infer_engine.generation.async_engine import (
+    AsyncInferenceEngine,
+    AsyncPDInferenceEngine,
+)
 from nano_infer_engine.generation.config import GenerationConfig
+from nano_infer_engine.models.llama import Llama3_2, LlamaConfig
 from nano_infer_engine.paged_cache import PagedKVCache
 from nano_infer_engine.service.app import InferenceRuntime, create_app
 
@@ -121,6 +125,65 @@ def _build_runtime() -> tuple[InferenceRuntime, PagedKVCache]:
     )
 
 
+def _build_pd_runtime() -> tuple[
+    InferenceRuntime,
+    PagedKVCache,
+    PagedKVCache,
+]:
+    def build_model() -> Llama3_2:
+        model = Llama3_2(
+            LlamaConfig(
+                vocab_size=8,
+                hidden_size=8,
+                mlp_inner_size=16,
+                num_layers=1,
+                q_head_num=2,
+                kv_head_num=1,
+                rope_type="default",
+                max_seq_len=8,
+                tie_word_embeddings=False,
+            )
+        ).eval()
+        for parameter in model.parameters():
+            parameter.data.zero_()
+        return model
+
+    def build_cache() -> PagedKVCache:
+        return PagedKVCache(
+            num_blocks=4,
+            block_size=1,
+            num_layers=1,
+            kv_head_num=1,
+            head_dim=4,
+            dtype=torch.float32,
+            device="cpu",
+        )
+
+    prefill_cache = build_cache()
+    decode_cache = build_cache()
+    engine = AsyncPDInferenceEngine(
+        build_model(),
+        build_model(),
+        GenerationConfig(
+            max_new_tokens=2,
+            eos_token_id=None,
+            use_cache=True,
+        ),
+        prefill_cache,
+        decode_cache,
+        max_batch_size=1,
+    )
+    return (
+        InferenceRuntime(
+            engine=engine,
+            tokenizer=_ServiceTokenizer(),
+            device=torch.device("cpu"),
+        ),
+        prefill_cache,
+        decode_cache,
+    )
+
+
 def test_http_service_uses_one_runtime_for_its_lifespan() -> None:
     async def scenario() -> None:
         runtime, cache = _build_runtime()
@@ -174,5 +237,49 @@ def test_http_service_uses_one_runtime_for_its_lifespan() -> None:
 
         assert runtime.engine.is_closed
         assert cache.allocator.allocated_block_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_http_service_accepts_concurrent_requests_with_pd_runtime() -> None:
+    async def scenario() -> None:
+        runtime, prefill_cache, decode_cache = _build_pd_runtime()
+        app = create_app(lambda: runtime)
+        transport = httpx.ASGITransport(app=app)
+
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                response_a, response_b = await asyncio.gather(
+                    client.post(
+                        "/generate",
+                        json={
+                            "prompt": "hello",
+                            "sequence_id": "request-a",
+                        },
+                    ),
+                    client.post(
+                        "/generate",
+                        json={
+                            "prompt": "world",
+                            "sequence_id": "request-b",
+                        },
+                    ),
+                )
+                assert response_a.status_code == 200
+                assert response_b.status_code == 200
+                assert response_a.json()["token_ids"] == [0, 0]
+                assert response_b.json()["token_ids"] == [0, 0]
+
+                health = (await client.get("/health")).json()
+                assert health["pending_requests"] == 0
+                assert health["active_requests"] == 0
+                assert health["free_blocks"] == 4
+
+        assert runtime.engine.is_closed
+        assert prefill_cache.allocator.allocated_block_count == 0
+        assert decode_cache.allocator.allocated_block_count == 0
 
     asyncio.run(scenario())
