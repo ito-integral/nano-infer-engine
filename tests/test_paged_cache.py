@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from nano_infer_engine.cache import KVCache
-from nano_infer_engine.paged_cache import PagedKVCache
+from nano_infer_engine.paged_cache import PagedKVCache, PagedKVTransfer
 
 
 def _build_cache(**overrides: object) -> PagedKVCache:
@@ -249,3 +249,112 @@ def test_gather_matches_contiguous_kv_cache() -> None:
 
     torch.testing.assert_close(gathered_keys, contiguous_keys[0, :token_count])
     torch.testing.assert_close(gathered_values, contiguous_values[0, :token_count])
+
+
+def test_export_import_preserves_sequence_kv_and_length() -> None:
+    source = _build_cache(num_blocks=6)
+    destination = _build_cache(num_blocks=6)
+    token_count = 6
+
+    # Give the source and destination different physical block layouts.
+    source.ensure_capacity("temporary-a", 1)
+    source.ensure_capacity("temporary-b", 1)
+    source.release("temporary-a")
+    destination.ensure_capacity("temporary", 1)
+
+    source.ensure_capacity("request-a", token_count)
+    expected_by_layer = []
+    for layer_index in range(source.num_layers):
+        keys = torch.arange(
+            token_count * source.kv_head_num * source.head_dim,
+            dtype=source.keys.dtype,
+        ).reshape(token_count, source.kv_head_num, source.head_dim)
+        keys = keys + layer_index * 100
+        values = keys + 1000
+        source.write(layer_index, "request-a", 0, keys, values)
+        expected_by_layer.append((keys, values))
+    source.advance("request-a", token_count)
+
+    transfer = source.export_sequence("request-a")
+    destination.import_sequence("request-a", transfer)
+
+    assert destination.get_sequence_length("request-a") == token_count
+    assert destination.get_block_table("request-a") != source.get_block_table(
+        "request-a"
+    )
+    for layer_index, (expected_keys, expected_values) in enumerate(
+        expected_by_layer
+    ):
+        actual_keys, actual_values = destination.gather(
+            layer_index,
+            "request-a",
+            token_count,
+        )
+        torch.testing.assert_close(actual_keys, expected_keys)
+        torch.testing.assert_close(actual_values, expected_values)
+
+
+def test_export_sequence_returns_an_independent_snapshot() -> None:
+    source = _build_cache(num_blocks=2, num_layers=1)
+    # Capacity may include blocks reserved for future decode tokens.
+    source.ensure_capacity("request-a", 8)
+    keys = torch.ones(2, source.kv_head_num, source.head_dim)
+    values = keys + 1
+    source.write(0, "request-a", 0, keys, values)
+    source.advance("request-a", 2)
+
+    transfer = source.export_sequence("request-a")
+    source.keys.zero_()
+    source.values.zero_()
+
+    torch.testing.assert_close(transfer.keys[:, :, :2], keys[None, None])
+    torch.testing.assert_close(transfer.values[:, :, :2], values[None, None])
+    assert transfer.keys.shape[1] == 1
+    assert transfer.values.shape[1] == 1
+    assert torch.count_nonzero(transfer.keys[:, :, 2:]) == 0
+    assert torch.count_nonzero(transfer.values[:, :, 2:]) == 0
+
+
+def test_import_sequence_rejects_incompatible_layout_without_allocating() -> None:
+    destination = _build_cache(num_blocks=2)
+    transfer = PagedKVTransfer(
+        sequence_id="request-a",
+        sequence_length=1,
+        block_size=8,
+        num_layers=destination.num_layers,
+        kv_head_num=destination.kv_head_num,
+        head_dim=destination.head_dim,
+        keys=torch.empty(2, 1, 8, 2, 4),
+        values=torch.empty(2, 1, 8, 2, 4),
+    )
+
+    with pytest.raises(ValueError, match="layout does not match"):
+        destination.import_sequence("request-a", transfer)
+
+    assert destination.allocator.allocated_block_count == 0
+    with pytest.raises(KeyError, match="request-a"):
+        destination.get_block_table("request-a")
+
+
+def test_import_sequence_rolls_back_when_copy_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _build_cache(num_blocks=2)
+    destination = _build_cache(num_blocks=2)
+    source.ensure_capacity("request-a", 1)
+    keys = torch.ones(1, source.kv_head_num, source.head_dim)
+    source.write(0, "request-a", 0, keys, keys)
+    source.advance("request-a", 1)
+    transfer = source.export_sequence("request-a")
+
+    def fail_to_advance(sequence_id: str, token_count: int) -> None:
+        raise RuntimeError("simulated import failure")
+
+    monkeypatch.setattr(destination, "advance", fail_to_advance)
+
+    with pytest.raises(RuntimeError, match="simulated import failure"):
+        destination.import_sequence("request-a", transfer)
+
+    assert destination.allocator.allocated_block_count == 0
+    with pytest.raises(KeyError, match="request-a"):
+        destination.get_block_table("request-a")

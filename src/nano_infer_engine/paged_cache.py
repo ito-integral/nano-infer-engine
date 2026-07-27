@@ -1,6 +1,22 @@
+from dataclasses import dataclass
+
 import torch
 
 from nano_infer_engine.block_allocator import BlockAllocator
+
+
+@dataclass(frozen=True)
+class PagedKVTransfer:
+    """Device-independent logical blocks exported from one paged KV cache."""
+
+    sequence_id: str
+    sequence_length: int
+    block_size: int
+    num_layers: int
+    kv_head_num: int
+    head_dim: int
+    keys: torch.Tensor
+    values: torch.Tensor
 
 
 class PagedKVCache:
@@ -125,6 +141,101 @@ class PagedKVCache:
             raise ValueError("sequence_id must not be empty")
 
         return tuple(self._block_tables[sequence_id])
+
+    def export_sequence(self, sequence_id: str) -> PagedKVTransfer:
+        """Export one sequence as a snapshot ordered by logical block."""
+        block_table = self.get_block_table(sequence_id)
+        sequence_length = self.get_sequence_length(sequence_id)
+        if sequence_length <= 0:
+            raise ValueError("cannot export an empty sequence")
+        logical_block_count = (
+            sequence_length + self.block_size - 1
+        ) // self.block_size
+        block_table = block_table[:logical_block_count]
+
+        keys = torch.stack(
+            [self.keys[:, block_id] for block_id in block_table],
+            dim=1,
+        )
+        values = torch.stack(
+            [self.values[:, block_id] for block_id in block_table],
+            dim=1,
+        )
+
+        # Do not transfer unused storage from the final logical block.
+        valid_tokens_in_last_block = sequence_length % self.block_size
+        if valid_tokens_in_last_block:
+            keys[:, -1, valid_tokens_in_last_block:].zero_()
+            values[:, -1, valid_tokens_in_last_block:].zero_()
+
+        return PagedKVTransfer(
+            sequence_id=sequence_id,
+            sequence_length=sequence_length,
+            block_size=self.block_size,
+            num_layers=self.num_layers,
+            kv_head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            keys=keys,
+            values=values,
+        )
+
+    def import_sequence(
+        self,
+        sequence_id: str,
+        transfer: PagedKVTransfer,
+    ) -> None:
+        """Import logical K/V blocks and create a local physical block table."""
+        if not isinstance(sequence_id, str):
+            raise TypeError("sequence_id must be a string")
+        if not sequence_id:
+            raise ValueError("sequence_id must not be empty")
+        if not isinstance(transfer, PagedKVTransfer):
+            raise TypeError("transfer must be a PagedKVTransfer")
+        if sequence_id in self._block_tables:
+            raise ValueError(f"sequence ID already exists: {sequence_id}")
+
+        expected_block_count = (
+            transfer.sequence_length + self.block_size - 1
+        ) // self.block_size
+        expected_shape = (
+            self.num_layers,
+            expected_block_count,
+            self.block_size,
+            self.kv_head_num,
+            self.head_dim,
+        )
+        if transfer.sequence_length <= 0:
+            raise ValueError("transfer sequence length must be positive")
+        if (
+            transfer.block_size != self.block_size
+            or transfer.num_layers != self.num_layers
+            or transfer.kv_head_num != self.kv_head_num
+            or transfer.head_dim != self.head_dim
+        ):
+            raise ValueError("transfer layout does not match the destination cache")
+        if transfer.keys.shape != expected_shape:
+            raise ValueError("transfer keys have an invalid shape")
+        if transfer.values.shape != expected_shape:
+            raise ValueError("transfer values have an invalid shape")
+        if transfer.keys.dtype != self.keys.dtype:
+            raise ValueError("transfer keys must match the cache dtype")
+        if transfer.values.dtype != self.values.dtype:
+            raise ValueError("transfer values must match the cache dtype")
+
+        self.ensure_capacity(sequence_id, transfer.sequence_length)
+        try:
+            block_table = self.get_block_table(sequence_id)
+            for logical_block, physical_block in enumerate(block_table):
+                self.keys[:, physical_block].copy_(
+                    transfer.keys[:, logical_block]
+                )
+                self.values[:, physical_block].copy_(
+                    transfer.values[:, logical_block]
+                )
+            self.advance(sequence_id, transfer.sequence_length)
+        except Exception:
+            self.release(sequence_id)
+            raise
 
     def _resolve_position(
         self,
