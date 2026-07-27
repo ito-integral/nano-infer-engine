@@ -278,6 +278,80 @@ def test_http_service_accepts_concurrent_requests_with_pd_runtime() -> None:
                 assert response_a.json()["token_ids"] == [0, 0]
                 assert response_b.json()["token_ids"] == [0, 0]
 
+                models_response = await client.get("/v1/models")
+                assert models_response.status_code == 200
+                assert models_response.json()["object"] == "list"
+                assert models_response.json()["data"][0]["id"] == (
+                    "test-pd-model"
+                )
+
+                chat_response = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test-pd-model",
+                        "messages": [
+                            {"role": "user", "content": "hello"}
+                        ],
+                        "max_tokens": 1,
+                        "temperature": 0,
+                    },
+                )
+                assert chat_response.status_code == 200
+                chat_body = chat_response.json()
+                assert chat_body["id"].startswith("chatcmpl-")
+                assert chat_body["object"] == "chat.completion"
+                assert chat_body["model"] == "test-pd-model"
+                assert chat_body["choices"] == [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "0",
+                        },
+                        "finish_reason": "length",
+                    }
+                ]
+                assert chat_body["usage"] == {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                }
+
+                unknown_model = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "missing-model",
+                        "messages": [
+                            {"role": "user", "content": "hello"}
+                        ],
+                    },
+                )
+                assert unknown_model.status_code == 404
+
+                streaming_response = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test-pd-model",
+                        "messages": [
+                            {"role": "user", "content": "hello"}
+                        ],
+                        "stream": True,
+                    },
+                )
+                assert streaming_response.status_code == 400
+
+                sampling_response = await client.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test-pd-model",
+                        "messages": [
+                            {"role": "user", "content": "hello"}
+                        ],
+                        "temperature": 0.5,
+                    },
+                )
+                assert sampling_response.status_code == 400
+
                 health = (await client.get("/health")).json()
                 assert health["pending_requests"] == 0
                 assert health["active_requests"] == 0

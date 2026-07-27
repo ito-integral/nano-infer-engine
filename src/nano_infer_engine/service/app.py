@@ -1,7 +1,9 @@
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from time import time
+from typing import Any, Literal
+from uuid import uuid4
 
 import torch
 from fastapi import FastAPI, HTTPException, Request
@@ -48,6 +50,57 @@ class HealthResponse(BaseModel):
     free_blocks: int
 
 
+class OpenAIModel(BaseModel):
+    id: str
+    object: Literal["model"] = "model"
+    created: int
+    owned_by: str = "nano-infer-engine"
+
+
+class OpenAIModelList(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[OpenAIModel]
+
+
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str = Field(min_length=1)
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: list[ChatMessage] = Field(min_length=1)
+    max_tokens: int | None = Field(default=None, gt=0)
+    temperature: float = 0.0
+    stream: bool = False
+
+
+class ChatCompletionMessage(BaseModel):
+    role: Literal["assistant"] = "assistant"
+    content: str
+
+
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: ChatCompletionMessage
+    finish_reason: Literal["stop", "length"]
+
+
+class ChatCompletionUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int
+    model: str
+    choices: list[ChatCompletionChoice]
+    usage: ChatCompletionUsage
+
+
 def create_app(
     runtime_factory: Callable[[], InferenceRuntime],
 ) -> FastAPI:
@@ -68,6 +121,35 @@ def create_app(
         version="0.1.0",
         lifespan=lifespan,
     )
+
+    async def run_generation(
+        runtime: InferenceRuntime,
+        input_ids: torch.Tensor,
+        sequence_id: str | None,
+        max_tokens: int | None = None,
+    ):
+        try:
+            handle = await runtime.engine.submit(
+                input_ids,
+                sequence_id=sequence_id,
+            )
+        except (TypeError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+        token_ids = []
+        stopped_by_request_limit = False
+        try:
+            async for event in handle:
+                token_ids.append(event.token_id)
+                if max_tokens is not None and len(token_ids) >= max_tokens:
+                    stopped_by_request_limit = await handle.cancel()
+                    break
+            result = await handle.result()
+        except Exception as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        return token_ids, result, stopped_by_request_limit
 
     @app.get("/health", response_model=HealthResponse)
     async def health(http_request: Request) -> HealthResponse:
@@ -102,21 +184,11 @@ def create_app(
             return_tensors="pt",
         ).input_ids.to(runtime.device)
 
-        try:
-            handle = await runtime.engine.submit(
-                input_ids,
-                sequence_id=body.sequence_id,
-            )
-        except (TypeError, ValueError) as error:
-            raise HTTPException(status_code=400, detail=str(error)) from error
-        except RuntimeError as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
-
-        try:
-            token_ids = [event.token_id async for event in handle]
-            result = await handle.result()
-        except Exception as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
+        token_ids, result, _ = await run_generation(
+            runtime,
+            input_ids,
+            body.sequence_id,
+        )
         if result.status is RequestStatus.FAILED:
             detail = str(result.error) if result.error is not None else "generation failed"
             raise HTTPException(status_code=500, detail=detail)
@@ -132,6 +204,111 @@ def create_app(
             generated_tokens=result.generated_tokens,
             stopped_by_eos=result.stopped_by_eos,
             status=result.status.value,
+        )
+
+    @app.get("/v1/models", response_model=OpenAIModelList)
+    async def list_models(http_request: Request) -> OpenAIModelList:
+        runtime: InferenceRuntime = http_request.app.state.runtime
+        return OpenAIModelList(
+            data=[
+                OpenAIModel(
+                    id=runtime.served_model_name,
+                    created=int(time()),
+                )
+            ]
+        )
+
+    @app.post(
+        "/v1/chat/completions",
+        response_model=ChatCompletionResponse,
+    )
+    async def create_chat_completion(
+        body: ChatCompletionRequest,
+        http_request: Request,
+    ) -> ChatCompletionResponse:
+        runtime: InferenceRuntime = http_request.app.state.runtime
+        if body.model != runtime.served_model_name:
+            raise HTTPException(status_code=404, detail="model not found")
+        if body.stream:
+            raise HTTPException(
+                status_code=400,
+                detail="streaming chat completions are not supported",
+            )
+        if body.temperature != 0:
+            raise HTTPException(
+                status_code=400,
+                detail="only greedy decoding with temperature=0 is supported",
+            )
+
+        engine_max_tokens = runtime.engine.scheduler.config.max_new_tokens
+        if body.max_tokens is not None and body.max_tokens > engine_max_tokens:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "max_tokens cannot exceed the engine limit "
+                    f"({engine_max_tokens})"
+                ),
+            )
+
+        messages = [message.model_dump() for message in body.messages]
+        formatted_prompt = runtime.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        input_ids = runtime.tokenizer(
+            formatted_prompt,
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).input_ids.to(runtime.device)
+        completion_id = f"chatcmpl-{uuid4().hex}"
+        token_ids, result, stopped_by_request_limit = await run_generation(
+            runtime,
+            input_ids,
+            completion_id,
+            body.max_tokens,
+        )
+
+        intentionally_cancelled = (
+            stopped_by_request_limit
+            and result.status is RequestStatus.CANCELLED
+        )
+        if result.status is RequestStatus.FAILED:
+            detail = (
+                str(result.error)
+                if result.error is not None
+                else "generation failed"
+            )
+            raise HTTPException(status_code=500, detail=detail)
+        if result.status is RequestStatus.CANCELLED and not intentionally_cancelled:
+            raise HTTPException(status_code=409, detail="generation was cancelled")
+
+        completion_tokens = len(token_ids)
+        prompt_tokens = input_ids.shape[1]
+        finish_reason: Literal["stop", "length"] = (
+            "stop" if result.stopped_by_eos else "length"
+        )
+        return ChatCompletionResponse(
+            id=completion_id,
+            created=int(time()),
+            model=runtime.served_model_name,
+            choices=[
+                ChatCompletionChoice(
+                    index=0,
+                    message=ChatCompletionMessage(
+                        content=runtime.tokenizer.decode(
+                            token_ids,
+                            skip_special_tokens=True,
+                        )
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=ChatCompletionUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+            ),
         )
 
     return app
