@@ -85,6 +85,7 @@ def pd_greedy_generate(
         )
         transfer = prefill_cache.export_sequence(sequence_id)
         decode_cache.import_sequence(sequence_id, transfer)
+        # 尽早释放不需要的内存
         del transfer
         last_logits = last_logits.to(decode_cache.keys.device)
     except Exception:

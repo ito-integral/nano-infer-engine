@@ -104,6 +104,59 @@ class ContinuousBatchingScheduler:
         self._requests[sequence_id] = request
         return request
 
+    def add_prefilled_request(
+        self,
+        request: PagedRequest,
+        last_logits: torch.Tensor,
+    ) -> None:
+        """Admit a request whose KV has already been imported into this cache."""
+        if self._closed:
+            raise RuntimeError("scheduler is closed")
+        if not isinstance(request, PagedRequest):
+            raise TypeError("request must be a PagedRequest")
+        if request.sequence_id in self._requests:
+            raise ValueError(
+                f"sequence ID already submitted: {request.sequence_id}"
+            )
+        if request.status is not RequestStatus.PENDING:
+            raise ValueError("prefilled request must have pending status")
+        if (
+            isinstance(request.required_blocks, bool)
+            or not isinstance(request.required_blocks, int)
+            or request.required_blocks <= 0
+        ):
+            raise ValueError("prefilled request must reserve at least one block")
+        if len(self.active_requests) >= self.max_batch_size:
+            raise ValueError("decode batch is full")
+        if request.prompt.device != self.paged_cache.keys.device:
+            raise ValueError("prefilled prompt must be on the decode cache device")
+        if not isinstance(last_logits, torch.Tensor):
+            raise TypeError("last_logits must be a torch.Tensor")
+        if last_logits.ndim != 1:
+            raise ValueError("last_logits must be a 1D tensor")
+        if last_logits.device != self.paged_cache.keys.device:
+            raise ValueError("last_logits must be on the decode cache device")
+        if (
+            self.reserved_blocks + request.required_blocks
+            > self.block_budget
+        ):
+            raise ValueError("not enough reserved decode cache blocks")
+
+        try:
+            cached_length = self.paged_cache.get_sequence_length(
+                request.sequence_id
+            )
+        except KeyError:
+            raise ValueError("prefilled request is missing decode KV") from None
+        if cached_length != request.prompt.shape[1]:
+            raise ValueError("decode KV length must match the prompt length")
+
+        request.last_logits = last_logits
+        request.status = RequestStatus.ACTIVE
+        self.active_requests.append(request)
+        self.reserved_blocks += request.required_blocks
+        self._requests[request.sequence_id] = request
+
     def _release_request_cache(self, sequence_id: str) -> None:
         try:
             self.paged_cache.get_block_table(sequence_id)
