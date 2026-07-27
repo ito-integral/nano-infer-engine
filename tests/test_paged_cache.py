@@ -358,3 +358,56 @@ def test_import_sequence_rolls_back_when_copy_fails(
     assert destination.allocator.allocated_block_count == 0
     with pytest.raises(KeyError, match="request-a"):
         destination.get_block_table("request-a")
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="requires at least two CUDA devices",
+)
+def test_export_import_across_two_cuda_devices() -> None:
+    source = _build_cache(device="cuda:0", num_blocks=4)
+    destination = _build_cache(device="cuda:1", num_blocks=4)
+    token_count = 6
+
+    # Reserve one destination block so its physical mapping differs.
+    destination.ensure_capacity("temporary", 1)
+    source.ensure_capacity("request-a", token_count)
+
+    expected_by_layer = []
+    for layer_index in range(source.num_layers):
+        keys = torch.arange(
+            token_count * source.kv_head_num * source.head_dim,
+            dtype=source.keys.dtype,
+            device="cuda:0",
+        ).reshape(token_count, source.kv_head_num, source.head_dim)
+        keys = keys + layer_index * 100
+        values = keys + 1000
+        source.write(layer_index, "request-a", 0, keys, values)
+        expected_by_layer.append((keys, values))
+    source.advance("request-a", token_count)
+
+    transfer = source.export_sequence("request-a")
+    assert transfer.keys.device == torch.device("cuda:0")
+    assert transfer.values.device == torch.device("cuda:0")
+
+    destination.import_sequence("request-a", transfer)
+
+    assert destination.keys.device == torch.device("cuda:1")
+    assert destination.values.device == torch.device("cuda:1")
+    assert destination.get_sequence_length("request-a") == token_count
+    for layer_index, (expected_keys, expected_values) in enumerate(
+        expected_by_layer
+    ):
+        actual_keys, actual_values = destination.gather(
+            layer_index,
+            "request-a",
+            token_count,
+        )
+        torch.testing.assert_close(
+            actual_keys,
+            expected_keys.to("cuda:1"),
+        )
+        torch.testing.assert_close(
+            actual_values,
+            expected_values.to("cuda:1"),
+        )
