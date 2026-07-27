@@ -119,3 +119,69 @@ def test_paged_prefill_checks_total_capacity_before_writing() -> None:
         cache.get_block_table("request-a")
     with pytest.raises(KeyError):
         cache.get_block_table("request-b")
+
+
+def test_decode_after_kv_transfer_matches_decode_without_transfer() -> None:
+    model = _build_model()
+    prompt = torch.tensor([[1, 4, 7]])
+    reference_cache = _build_cache(model)
+    source_cache = _build_cache(model)
+    destination_cache = _build_cache(model)
+
+    # Make the destination use a different physical block mapping.
+    destination_cache.ensure_capacity("temporary", 1)
+
+    with torch.inference_mode():
+        reference_prefill_logits = paged_prefill(
+            model,
+            (prompt,),
+            reference_cache,
+            ("reference",),
+        )
+        source_prefill_logits = paged_prefill(
+            model,
+            (prompt,),
+            source_cache,
+            ("migrated",),
+        )
+        next_token = reference_prefill_logits.argmax(dim=-1, keepdim=True)
+
+        expected_decode_logits = model(
+            next_token,
+            kv_cache=reference_cache,
+            sequence_id="reference",
+        )
+
+        transfer = source_cache.export_sequence("migrated")
+        destination_cache.import_sequence("migrated", transfer)
+        actual_decode_logits = model(
+            next_token,
+            kv_cache=destination_cache,
+            sequence_id="migrated",
+        )
+
+    torch.testing.assert_close(
+        source_prefill_logits,
+        reference_prefill_logits,
+    )
+    torch.testing.assert_close(actual_decode_logits, expected_decode_logits)
+    assert destination_cache.get_block_table(
+        "migrated"
+    ) != reference_cache.get_block_table("reference")
+
+    expected_length = prompt.shape[1] + 1
+    assert reference_cache.get_sequence_length("reference") == expected_length
+    assert destination_cache.get_sequence_length("migrated") == expected_length
+    for layer_index in range(len(model.decoders)):
+        reference_keys, reference_values = reference_cache.gather(
+            layer_index,
+            "reference",
+            expected_length,
+        )
+        migrated_keys, migrated_values = destination_cache.gather(
+            layer_index,
+            "migrated",
+            expected_length,
+        )
+        torch.testing.assert_close(migrated_keys, reference_keys)
+        torch.testing.assert_close(migrated_values, reference_values)
