@@ -21,6 +21,7 @@ class InferenceRuntime:
     engine: AsyncInferenceEngine | AsyncPDInferenceEngine
     tokenizer: Any
     device: torch.device
+    served_model_name: str
 
 
 class GenerateRequest(BaseModel):
@@ -30,6 +31,7 @@ class GenerateRequest(BaseModel):
 
 class GenerateResponse(BaseModel):
     sequence_id: str
+    model: str
     text: str
     token_ids: list[int]
     generated_tokens: int
@@ -124,6 +126,7 @@ def create_app(
         text = runtime.tokenizer.decode(token_ids, skip_special_tokens=True)
         return GenerateResponse(
             sequence_id=result.sequence_id,
+            model=runtime.served_model_name,
             text=text,
             token_ids=token_ids,
             generated_tokens=result.generated_tokens,

@@ -37,6 +37,16 @@ def _apply_max_model_len(model_config: LlamaConfig) -> None:
     model_config.max_seq_len = max_model_len
 
 
+def _resolve_served_model_name(model_path: Path) -> str:
+    configured_name = os.getenv("NANO_SERVED_MODEL_NAME")
+    if configured_name is None:
+        return str(model_path)
+    served_model_name = configured_name.strip()
+    if not served_model_name:
+        raise ValueError("NANO_SERVED_MODEL_NAME must not be empty")
+    return served_model_name
+
+
 def _load_model(
     model_config,
     model_path: Path,
@@ -69,6 +79,7 @@ def _build_cache(
 def build_default_runtime() -> InferenceRuntime:
     """Load the configured model and construct one process-wide engine."""
     model_path = Path(os.getenv("NANO_MODEL_PATH", DEFAULT_MODEL_PATH))
+    served_model_name = _resolve_served_model_name(model_path)
     device_name = os.getenv(
         "NANO_DEVICE",
         "cuda" if torch.cuda.is_available() else "cpu",
@@ -108,6 +119,7 @@ def build_default_runtime() -> InferenceRuntime:
         engine=engine,
         tokenizer=tokenizer,
         device=device,
+        served_model_name=served_model_name,
     )
 
 
@@ -117,6 +129,7 @@ def build_pd_runtime() -> InferenceRuntime:
         raise RuntimeError("P/D runtime requires at least two CUDA devices")
 
     model_path = Path(os.getenv("NANO_MODEL_PATH", DEFAULT_MODEL_PATH))
+    served_model_name = _resolve_served_model_name(model_path)
     prefill_device = torch.device(
         os.getenv("NANO_PREFILL_DEVICE", "cuda:0")
     )
@@ -180,4 +193,5 @@ def build_pd_runtime() -> InferenceRuntime:
         engine=engine,
         tokenizer=tokenizer,
         device=prefill_device,
+        served_model_name=served_model_name,
     )

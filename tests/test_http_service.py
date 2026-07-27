@@ -120,6 +120,7 @@ def _build_runtime() -> tuple[InferenceRuntime, PagedKVCache]:
             engine=engine,
             tokenizer=_ServiceTokenizer(),
             device=torch.device("cpu"),
+            served_model_name="test-model",
         ),
         cache,
     )
@@ -178,6 +179,7 @@ def _build_pd_runtime() -> tuple[
             engine=engine,
             tokenizer=_ServiceTokenizer(),
             device=torch.device("cpu"),
+            served_model_name="test-pd-model",
         ),
         prefill_cache,
         decode_cache,
@@ -222,6 +224,7 @@ def test_http_service_uses_one_runtime_for_its_lifespan() -> None:
                 assert generation_response.status_code == 200
                 assert generation_response.json() == {
                     "sequence_id": "request-a",
+                    "model": "test-model",
                     "text": "3",
                     "token_ids": [3, 2],
                     "generated_tokens": 2,
@@ -270,6 +273,8 @@ def test_http_service_accepts_concurrent_requests_with_pd_runtime() -> None:
                 )
                 assert response_a.status_code == 200
                 assert response_b.status_code == 200
+                assert response_a.json()["model"] == "test-pd-model"
+                assert response_b.json()["model"] == "test-pd-model"
                 assert response_a.json()["token_ids"] == [0, 0]
                 assert response_b.json()["token_ids"] == [0, 0]
 
