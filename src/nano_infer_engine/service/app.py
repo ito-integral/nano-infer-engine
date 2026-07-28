@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -7,6 +8,7 @@ from uuid import uuid4
 
 import torch
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from nano_infer_engine.generation.async_engine import (
@@ -67,12 +69,17 @@ class ChatMessage(BaseModel):
     content: str = Field(min_length=1)
 
 
+class ChatCompletionStreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage] = Field(min_length=1)
     max_tokens: int | None = Field(default=None, gt=0)
     temperature: float = 0.0
     stream: bool = False
+    stream_options: ChatCompletionStreamOptions | None = None
 
 
 class ChatCompletionMessage(BaseModel):
@@ -225,15 +232,10 @@ def create_app(
     async def create_chat_completion(
         body: ChatCompletionRequest,
         http_request: Request,
-    ) -> ChatCompletionResponse:
+    ) -> ChatCompletionResponse | StreamingResponse:
         runtime: InferenceRuntime = http_request.app.state.runtime
         if body.model != runtime.served_model_name:
             raise HTTPException(status_code=404, detail="model not found")
-        if body.stream:
-            raise HTTPException(
-                status_code=400,
-                detail="streaming chat completions are not supported",
-            )
         if body.temperature != 0:
             raise HTTPException(
                 status_code=400,
@@ -262,6 +264,122 @@ def create_app(
             return_tensors="pt",
         ).input_ids.to(runtime.device)
         completion_id = f"chatcmpl-{uuid4().hex}"
+        if body.stream:
+            try:
+                handle = await runtime.engine.submit(
+                    input_ids,
+                    sequence_id=completion_id,
+                )
+            except (TypeError, ValueError) as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail=str(error),
+                ) from error
+            except RuntimeError as error:
+                raise HTTPException(
+                    status_code=503,
+                    detail=str(error),
+                ) from error
+
+            async def stream_chunks():
+                token_ids: list[int] = []
+                decoded_text = ""
+                result = None
+                created = int(time())
+
+                def encode_chunk(payload: dict[str, Any]) -> str:
+                    return f"data: {json.dumps(payload)}\n\n"
+
+                try:
+                    async for event in handle:
+                        token_ids.append(event.token_id)
+                        current_text = runtime.tokenizer.decode(
+                            token_ids,
+                            skip_special_tokens=True,
+                        )
+                        if current_text.startswith(decoded_text):
+                            delta = current_text[len(decoded_text) :]
+                        else:
+                            delta = runtime.tokenizer.decode(
+                                [event.token_id],
+                                skip_special_tokens=True,
+                            )
+                        decoded_text = current_text
+                        if delta:
+                            yield encode_chunk(
+                                {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": runtime.served_model_name,
+                                    "choices": [
+                                        {
+                                            "index": 0,
+                                            "delta": {"content": delta},
+                                            "finish_reason": None,
+                                        }
+                                    ],
+                                }
+                            )
+                        if (
+                            body.max_tokens is not None
+                            and len(token_ids) >= body.max_tokens
+                        ):
+                            await handle.cancel()
+                            break
+
+                    result = await handle.result()
+                    finish_reason = (
+                        "stop" if result.stopped_by_eos else "length"
+                    )
+                    yield encode_chunk(
+                        {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": runtime.served_model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": finish_reason,
+                                }
+                            ],
+                        }
+                    )
+                    if (
+                        body.stream_options is not None
+                        and body.stream_options.include_usage
+                    ):
+                        prompt_tokens = input_ids.shape[1]
+                        completion_tokens = len(token_ids)
+                        yield encode_chunk(
+                            {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": runtime.served_model_name,
+                                "choices": [],
+                                "usage": {
+                                    "prompt_tokens": prompt_tokens,
+                                    "completion_tokens": completion_tokens,
+                                    "total_tokens": (
+                                        prompt_tokens + completion_tokens
+                                    ),
+                                },
+                            }
+                        )
+                    yield "data: [DONE]\n\n"
+                finally:
+                    if result is None:
+                        await handle.cancel()
+
+            return StreamingResponse(
+                stream_chunks(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
+
         token_ids, result, stopped_by_request_limit = await run_generation(
             runtime,
             input_ids,

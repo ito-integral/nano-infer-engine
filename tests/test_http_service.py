@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -336,9 +337,35 @@ def test_http_service_accepts_concurrent_requests_with_pd_runtime() -> None:
                             {"role": "user", "content": "hello"}
                         ],
                         "stream": True,
+                        "stream_options": {"include_usage": True},
+                        "max_tokens": 2,
                     },
                 )
-                assert streaming_response.status_code == 400
+                assert streaming_response.status_code == 200
+                assert streaming_response.headers["content-type"].startswith(
+                    "text/event-stream"
+                )
+                stream_payloads = [
+                    line.removeprefix("data: ")
+                    for line in streaming_response.text.splitlines()
+                    if line.startswith("data: ")
+                ]
+                assert stream_payloads[-1] == "[DONE]"
+                stream_events = [
+                    json.loads(payload)
+                    for payload in stream_payloads[:-1]
+                ]
+                assert "".join(
+                    event["choices"][0]["delta"].get("content", "")
+                    for event in stream_events
+                    if event["choices"]
+                ) == "0 0"
+                assert stream_events[-1]["choices"] == []
+                assert stream_events[-1]["usage"] == {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "total_tokens": 3,
+                }
 
                 sampling_response = await client.post(
                     "/v1/chat/completions",
