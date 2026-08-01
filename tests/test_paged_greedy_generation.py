@@ -527,6 +527,62 @@ def test_scheduler_cleans_up_failed_prefill_and_continues() -> None:
     assert cache.allocator.allocated_block_count == 0
 
 
+def test_scheduler_advances_chunked_prefill_once_per_step() -> None:
+    torch.manual_seed(0)
+    model = Llama3_2(
+        LlamaConfig(
+            vocab_size=16,
+            hidden_size=8,
+            mlp_inner_size=16,
+            num_layers=1,
+            q_head_num=2,
+            kv_head_num=1,
+            rope_type="default",
+            max_seq_len=8,
+            tie_word_embeddings=False,
+        )
+    ).eval()
+    cache = PagedKVCache(
+        num_blocks=8,
+        block_size=1,
+        num_layers=1,
+        kv_head_num=1,
+        head_dim=4,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    scheduler = ContinuousBatchingScheduler(
+        model,
+        GenerationConfig(
+            max_new_tokens=1,
+            use_cache=True,
+            prefill_chunk_size=2,
+        ),
+        cache,
+        max_batch_size=1,
+    )
+    request = scheduler.add_request(
+        "request-a", torch.tensor([[1, 2, 3, 4, 5]])
+    )
+
+    assert scheduler.step().token_events == ()
+    assert request.status is RequestStatus.PREFILLING
+    assert request.prefill_offset == 2
+    assert cache.get_sequence_length(request.sequence_id) == 2
+
+    assert scheduler.step().token_events == ()
+    assert request.status is RequestStatus.PREFILLING
+    assert request.prefill_offset == 4
+    assert cache.get_sequence_length(request.sequence_id) == 4
+
+    output = scheduler.step()
+    assert len(output.token_events) == 1
+    assert output.terminal_requests == (request,)
+    assert request.status is RequestStatus.COMPLETED
+    assert request.prefill_offset == 5
+    assert not scheduler.has_work
+
+
 def test_scheduler_cancels_pending_and_active_requests() -> None:
     model = _ScriptedPagedModel(
         {

@@ -8,6 +8,7 @@ class RequestStatus(str, Enum):
     """Lifecycle state of a paged generation request."""
 
     PENDING = "pending"
+    PREFILLING = "prefilling"
     ACTIVE = "active"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -25,6 +26,7 @@ class PagedRequest:
     finished: bool = False
     required_blocks: int = 0
     last_logits: torch.Tensor | None = None
+    prefill_offset: int = 0
     status: RequestStatus = RequestStatus.PENDING
     error: Exception | None = None
 

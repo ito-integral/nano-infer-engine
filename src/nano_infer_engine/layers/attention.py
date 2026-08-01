@@ -341,3 +341,74 @@ class GroupedQueryAttention(nn.Module):
 
         assert output.shape == x.shape
         return output
+
+    def forward_ragged(
+        self,
+        x: torch.Tensor,
+        *,
+        paged_cache: PagedKVCache,
+        layer_index: int,
+        sequence_ids: tuple[str, ...],
+        query_start_loc: torch.Tensor,
+        context_lengths: tuple[int, ...],
+    ) -> torch.Tensor:
+        """Reference flattened attention for variable-length prefill chunks."""
+        total_tokens, hidden_size = x.shape
+        assert hidden_size == self.hidden_size
+
+        q = self.q_proj(x).view(total_tokens, self.q_head_num, self.head_dim)
+        k = self.k_proj(x).view(total_tokens, self.kv_head_num, self.head_dim)
+        v = self.v_proj(x).view(total_tokens, self.kv_head_num, self.head_dim)
+
+        position_ids = torch.empty(
+            total_tokens, dtype=torch.long, device=x.device
+        )
+        boundaries = query_start_loc.tolist()
+        for request_index, context_length in enumerate(context_lengths):
+            start, end = boundaries[request_index : request_index + 2]
+            position_ids[start:end] = torch.arange(
+                context_length,
+                context_length + end - start,
+                dtype=torch.long,
+                device=x.device,
+            )
+        q = self.rope(q.unsqueeze(0), position_ids=position_ids.unsqueeze(0))[0]
+        k = self.rope(k.unsqueeze(0), position_ids=position_ids.unsqueeze(0))[0]
+
+        contexts: list[torch.Tensor] = []
+        scale = self.head_dim ** (-0.5)
+        for request_index, sequence_id in enumerate(sequence_ids):
+            start, end = boundaries[request_index : request_index + 2]
+            context_length = context_lengths[request_index]
+            chunk_length = end - start
+            paged_cache.write(
+                layer_index,
+                sequence_id,
+                context_length,
+                k[start:end],
+                v[start:end],
+            )
+            sequence_length = context_length + chunk_length
+            keys, values = paged_cache.gather(
+                layer_index, sequence_id, sequence_length
+            )
+            keys = keys.repeat_interleave(self.group_num, dim=1)
+            values = values.repeat_interleave(self.group_num, dim=1)
+            query = q[start:end].transpose(0, 1)
+            keys = keys.transpose(0, 1)
+            values = values.transpose(0, 1)
+            scores = query @ keys.transpose(-1, -2) * scale
+            query_positions = torch.arange(
+                context_length,
+                sequence_length,
+                device=x.device,
+            )[:, None]
+            key_positions = torch.arange(sequence_length, device=x.device)[None, :]
+            scores = scores.masked_fill(
+                key_positions > query_positions, float("-inf")
+            )
+            probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32)
+            context = probabilities.to(values.dtype) @ values
+            contexts.append(context.transpose(0, 1).reshape(chunk_length, hidden_size))
+
+        return self.o_proj(torch.cat(contexts, dim=0))

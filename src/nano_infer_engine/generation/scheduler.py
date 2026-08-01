@@ -6,7 +6,11 @@ from nano_infer_engine.paged_cache import PagedKVCache
 
 from .config import GenerationConfig
 from .events import SchedulerStepOutput, TokenEvent
-from .paged_prefill import _validate_paged_prefill_inputs, paged_prefill
+from .paged_prefill import (
+    _validate_paged_prefill_inputs,
+    paged_prefill,
+    paged_prefill_chunks,
+)
 from .request import PagedRequest, RequestStatus
 
 
@@ -41,6 +45,7 @@ class ContinuousBatchingScheduler:
         self.block_budget = paged_cache.allocator.free_block_count
 
         self.pending_requests: deque[PagedRequest] = deque()
+        self.prefilling_requests: list[PagedRequest] = []
         self.active_requests: list[PagedRequest] = []
         self.completed_requests: list[PagedRequest] = []
         self.reserved_blocks = 0
@@ -50,7 +55,9 @@ class ContinuousBatchingScheduler:
     @property
     def has_work(self) -> bool:
         """Return whether pending or active requests remain."""
-        return bool(self.pending_requests or self.active_requests)
+        return bool(
+            self.pending_requests or self.prefilling_requests or self.active_requests
+        )
 
     @property
     def pending_count(self) -> int:
@@ -59,6 +66,10 @@ class ContinuousBatchingScheduler:
     @property
     def active_count(self) -> int:
         return len(self.active_requests)
+
+    @property
+    def prefilling_count(self) -> int:
+        return len(self.prefilling_requests)
 
     @property
     def free_block_count(self) -> int:
@@ -176,7 +187,12 @@ class ContinuousBatchingScheduler:
             return
         self.paged_cache.release(sequence_id)
 
-    def _admit_pending_requests(self) -> list[PagedRequest]:
+    def _admit_pending_requests(
+        self, *, advance_prefill: bool = True
+    ) -> list[PagedRequest]:
+        if self.config.prefill_chunk_size is not None:
+            return self._advance_chunked_prefill(advance_prefill=advance_prefill)
+
         failed_requests: list[PagedRequest] = []
         admitted_requests: list[PagedRequest] = []
         while (
@@ -237,6 +253,66 @@ class ContinuousBatchingScheduler:
             self.reserved_blocks += request.required_blocks
         return failed_requests
 
+    def _advance_chunked_prefill(
+        self, *, advance_prefill: bool
+    ) -> list[PagedRequest]:
+        terminal_requests: list[PagedRequest] = []
+        occupied_slots = len(self.active_requests) + len(self.prefilling_requests)
+        while self.pending_requests and occupied_slots < self.max_batch_size:
+            request = self.pending_requests[0]
+            if self.reserved_blocks + request.required_blocks > self.block_budget:
+                break
+            self.pending_requests.popleft()
+            request.status = RequestStatus.PREFILLING
+            self.prefilling_requests.append(request)
+            self.reserved_blocks += request.required_blocks
+            occupied_slots += 1
+
+        if not advance_prefill or not self.prefilling_requests:
+            return terminal_requests
+
+        chunk_size = self.config.prefill_chunk_size
+        assert chunk_size is not None
+        chunks = tuple(
+            request.prompt[
+                :, request.prefill_offset : request.prefill_offset + chunk_size
+            ]
+            for request in self.prefilling_requests
+        )
+        sequence_ids = tuple(
+            request.sequence_id for request in self.prefilling_requests
+        )
+        try:
+            logits = paged_prefill_chunks(
+                self.model,
+                chunks,
+                self.paged_cache,
+                sequence_ids,
+            )
+        except Exception as error:
+            for request in self.prefilling_requests:
+                request.status = RequestStatus.FAILED
+                request.error = error
+                self.reserved_blocks -= request.required_blocks
+                self._release_request_cache(request.sequence_id)
+                terminal_requests.append(request)
+            self.prefilling_requests = []
+            return terminal_requests
+
+        still_prefilling: list[PagedRequest] = []
+        for request, request_logits, chunk in zip(
+            self.prefilling_requests, logits, chunks
+        ):
+            request.prefill_offset += chunk.shape[1]
+            request.last_logits = request_logits
+            if request.prefill_offset == request.prompt.shape[1]:
+                request.status = RequestStatus.ACTIVE
+                self.active_requests.append(request)
+            else:
+                still_prefilling.append(request)
+        self.prefilling_requests = still_prefilling
+        return terminal_requests
+
     def cancel_request(self, sequence_id: str) -> bool:
         """Cancel a pending or active request and release its cache blocks."""
         request = self._requests.get(sequence_id)
@@ -244,6 +320,7 @@ class ContinuousBatchingScheduler:
             raise KeyError(sequence_id)
         if request.status not in {
             RequestStatus.PENDING,
+            RequestStatus.PREFILLING,
             RequestStatus.ACTIVE,
         }:
             return False
@@ -254,6 +331,14 @@ class ContinuousBatchingScheduler:
                 for pending in self.pending_requests
                 if pending is not request
             )
+        elif request.status is RequestStatus.PREFILLING:
+            self.prefilling_requests = [
+                prefilling
+                for prefilling in self.prefilling_requests
+                if prefilling is not request
+            ]
+            self.reserved_blocks -= request.required_blocks
+            self._release_request_cache(request.sequence_id)
         else:
             self.active_requests = [
                 active
@@ -274,7 +359,11 @@ class ContinuousBatchingScheduler:
 
         self._closed = True
         cancelled_requests: list[PagedRequest] = []
-        for request in (*self.pending_requests, *self.active_requests):
+        for request in (
+            *self.pending_requests,
+            *self.prefilling_requests,
+            *self.active_requests,
+        ):
             request.status = RequestStatus.CANCELLED
             cancelled_requests.append(request)
 
@@ -282,6 +371,7 @@ class ContinuousBatchingScheduler:
             self._release_request_cache(request.sequence_id)
 
         self.pending_requests.clear()
+        self.prefilling_requests.clear()
         self.active_requests.clear()
         self.reserved_blocks = 0
         self.completed_requests.extend(cancelled_requests)
@@ -294,7 +384,7 @@ class ContinuousBatchingScheduler:
             raise RuntimeError("scheduler is closed")
         completed_now = self._admit_pending_requests()
         if not self.active_requests:
-            if self.pending_requests:
+            if self.pending_requests and not self.prefilling_requests:
                 raise RuntimeError("pending requests cannot be admitted")
             self.completed_requests.extend(completed_now)
             return SchedulerStepOutput((), tuple(completed_now))
@@ -376,7 +466,7 @@ class ContinuousBatchingScheduler:
                     completed_now.append(request)
                 self.active_requests = []
 
-        completed_now.extend(self._admit_pending_requests())
+        completed_now.extend(self._admit_pending_requests(advance_prefill=False))
         self.completed_requests.extend(completed_now)
         return SchedulerStepOutput(token_events, tuple(completed_now))
 

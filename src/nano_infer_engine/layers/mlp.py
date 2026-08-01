@@ -16,8 +16,7 @@ class SwiGLUMLP(nn.Module):
         self.gate_proj = nn.Linear(hidden_size, inner_size, bias=False)
 
     def forward(self, x):
-        bs, seq_len, hidden_size = x.shape
-        assert hidden_size == self.hidden_size
+        assert x.shape[-1] == self.hidden_size
         output = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         output = self.down_proj(output)
         return output

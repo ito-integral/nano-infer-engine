@@ -51,3 +51,24 @@ class Llama3Decoder(nn.Module):
         o = self.ffn(self.post_norm(h)) + h
 
         return o
+
+    def forward_ragged(
+        self,
+        x,
+        *,
+        paged_cache,
+        layer_index,
+        sequence_ids,
+        query_start_loc,
+        context_lengths,
+    ):
+        attn_output = self.attn.forward_ragged(
+            self.pre_norm(x),
+            paged_cache=paged_cache,
+            layer_index=layer_index,
+            sequence_ids=sequence_ids,
+            query_start_loc=query_start_loc,
+            context_lengths=context_lengths,
+        )
+        h = attn_output + x
+        return self.ffn(self.post_norm(h)) + h

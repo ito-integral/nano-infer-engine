@@ -1,7 +1,10 @@
 import pytest
 import torch
 
-from nano_infer_engine.generation.paged_prefill import paged_prefill
+from nano_infer_engine.generation.paged_prefill import (
+    paged_prefill,
+    paged_prefill_chunks,
+)
 from nano_infer_engine.models.llama import Llama3_2, LlamaConfig
 from nano_infer_engine.paged_cache import PagedKVCache
 
@@ -105,6 +108,97 @@ def test_paged_prefill_batches_each_prompt_length_once() -> None:
     assert tuple(
         cache.get_sequence_length(sequence_id) for sequence_id in sequence_ids
     ) == (2, 3, 2, 3)
+
+
+def test_chunked_prefill_matches_one_shot_prefill() -> None:
+    model = _build_model()
+    prompt = torch.tensor([[1, 4, 7, 10, 13]])
+    one_shot_cache = _build_cache(model, num_blocks=4)
+    chunked_cache = _build_cache(model, num_blocks=4)
+
+    with torch.inference_mode():
+        expected = paged_prefill(
+            model, (prompt,), one_shot_cache, ("one-shot",)
+        )[0]
+        paged_prefill_chunks(
+            model, (prompt[:, :2],), chunked_cache, ("chunked",)
+        )
+        paged_prefill_chunks(
+            model, (prompt[:, 2:4],), chunked_cache, ("chunked",)
+        )
+        actual = paged_prefill_chunks(
+            model, (prompt[:, 4:],), chunked_cache, ("chunked",)
+        )[0]
+
+    torch.testing.assert_close(actual, expected)
+    assert chunked_cache.get_sequence_length("chunked") == prompt.shape[1]
+    for layer_index in range(len(model.decoders)):
+        expected_keys, expected_values = one_shot_cache.gather(
+            layer_index, "one-shot", prompt.shape[1]
+        )
+        actual_keys, actual_values = chunked_cache.gather(
+            layer_index, "chunked", prompt.shape[1]
+        )
+        torch.testing.assert_close(actual_keys, expected_keys)
+        torch.testing.assert_close(actual_values, expected_values)
+
+
+def test_ragged_prefill_batches_different_tail_lengths() -> None:
+    model = _build_model()
+    cache = _build_cache(model, num_blocks=8)
+    reference_cache = _build_cache(model, num_blocks=8)
+    prompt_a = torch.tensor([[1, 2, 3, 4, 5]])
+    prompt_b = torch.tensor([[6, 7, 8, 9, 10, 11]])
+    sequence_ids = ("request-a", "request-b")
+
+    paged_prefill(
+        model,
+        (prompt_a[:, :4], prompt_b[:, :4]),
+        cache,
+        sequence_ids,
+    )
+    paged_prefill(
+        model,
+        (prompt_a[:, :4], prompt_b[:, :4]),
+        reference_cache,
+        ("reference-a", "reference-b"),
+    )
+    expected = torch.cat(
+        (
+            model(
+                prompt_a[:, 4:],
+                kv_cache=reference_cache,
+                sequence_id="reference-a",
+            )[:, -1],
+            model(
+                prompt_b[:, 4:],
+                kv_cache=reference_cache,
+                sequence_id="reference-b",
+            )[:, -1],
+        ),
+        dim=0,
+    )
+    call_count = 0
+    original_forward_ragged = model.forward_ragged
+
+    def recording_forward_ragged(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_forward_ragged(*args, **kwargs)
+
+    model.forward_ragged = recording_forward_ragged  # type: ignore[method-assign]
+    logits = paged_prefill_chunks(
+        model,
+        (prompt_a[:, 4:], prompt_b[:, 4:]),
+        cache,
+        sequence_ids,
+    )
+
+    assert call_count == 1
+    assert logits.shape == (2, model.config.vocab_size)
+    torch.testing.assert_close(logits, expected)
+    assert cache.get_sequence_length("request-a") == 5
+    assert cache.get_sequence_length("request-b") == 6
 
 
 def test_paged_prefill_rejects_mismatched_metadata() -> None:

@@ -105,3 +105,51 @@ def paged_prefill(
     if any(logits is None for logits in logits_by_index):
         raise RuntimeError("prefill did not produce logits for every prompt")
     return torch.stack([logits for logits in logits_by_index if logits is not None])
+
+
+@torch.inference_mode()
+def paged_prefill_chunks(
+    model,
+    chunks: tuple[torch.Tensor, ...],
+    paged_cache: PagedKVCache,
+    sequence_ids: tuple[str, ...],
+) -> torch.Tensor:
+    """Append flattened variable-length chunks and return their last logits."""
+    if not chunks:
+        raise ValueError("chunks must not be empty")
+    if len(chunks) != len(sequence_ids):
+        raise ValueError("chunks and sequence_ids must have the same length")
+    for chunk in chunks:
+        if not isinstance(chunk, torch.Tensor):
+            raise TypeError("each chunk must be a torch.Tensor")
+        if chunk.ndim != 2 or chunk.shape[0] != 1 or chunk.shape[1] <= 0:
+            raise ValueError("each chunk must have shape (1, chunk_length)")
+        if chunk.device != paged_cache.keys.device:
+            raise ValueError("each chunk must be on the paged cache device")
+    if len(set(sequence_ids)) != len(sequence_ids):
+        raise ValueError("sequence IDs must be unique")
+
+    flat_input_ids = torch.cat([chunk[0] for chunk in chunks])
+    query_lengths = torch.tensor(
+        [chunk.shape[1] for chunk in chunks],
+        dtype=torch.long,
+        device=flat_input_ids.device,
+    )
+    query_start_loc = torch.zeros(
+        len(chunks) + 1,
+        dtype=torch.long,
+        device=flat_input_ids.device,
+    )
+    query_start_loc[1:] = query_lengths.cumsum(dim=0)
+    try:
+        forward_ragged = model.forward_ragged
+    except AttributeError:
+        raise TypeError("model must implement forward_ragged") from None
+    logits = forward_ragged(
+        flat_input_ids,
+        kv_cache=paged_cache,
+        sequence_ids=sequence_ids,
+        query_start_loc=query_start_loc,
+    )
+    last_token_indices = query_start_loc[1:] - 1
+    return logits[last_token_indices]

@@ -335,3 +335,60 @@ class Llama3_2(nn.Module):
                 kv_cache.advance(current_sequence_id, seq_len)
 
         return x
+
+    def forward_ragged(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        kv_cache: PagedKVCache,
+        sequence_ids: tuple[str, ...],
+        query_start_loc: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run a flattened variable-query prefill over a paged KV cache."""
+        if input_ids.ndim != 1 or input_ids.numel() == 0:
+            raise ValueError("input_ids must be a non-empty 1D tensor")
+        if not isinstance(kv_cache, PagedKVCache):
+            raise TypeError("kv_cache must be a PagedKVCache")
+        if not sequence_ids or len(set(sequence_ids)) != len(sequence_ids):
+            raise ValueError("sequence_ids must be non-empty and unique")
+        if query_start_loc.ndim != 1 or query_start_loc.numel() != len(sequence_ids) + 1:
+            raise ValueError("query_start_loc must have one boundary per sequence")
+        if query_start_loc.device != input_ids.device:
+            raise ValueError("query_start_loc must be on the input device")
+        boundaries = query_start_loc.tolist()
+        if boundaries[0] != 0 or boundaries[-1] != input_ids.numel():
+            raise ValueError("query_start_loc must span all input tokens")
+        if any(end <= start for start, end in zip(boundaries, boundaries[1:])):
+            raise ValueError("each ragged query must contain at least one token")
+
+        context_lengths = tuple(
+            kv_cache.get_sequence_length(sequence_id) for sequence_id in sequence_ids
+        )
+        query_lengths = tuple(
+            end - start for start, end in zip(boundaries, boundaries[1:])
+        )
+        for sequence_id, context_length, query_length in zip(
+            sequence_ids, context_lengths, query_lengths
+        ):
+            sequence_length = context_length + query_length
+            if sequence_length > self.config.max_seq_len:
+                raise ValueError(
+                    f"Sequence length {sequence_length} exceeds "
+                    f"max_seq_len={self.config.max_seq_len}"
+                )
+            kv_cache.ensure_capacity(sequence_id, sequence_length)
+
+        x = self.embed(input_ids)
+        for layer_index, decoder in enumerate(self.decoders):
+            x = decoder.forward_ragged(
+                x,
+                paged_cache=kv_cache,
+                layer_index=layer_index,
+                sequence_ids=sequence_ids,
+                query_start_loc=query_start_loc,
+                context_lengths=context_lengths,
+            )
+        x = self.lm_head(self.final_rms(x))
+        for sequence_id, query_length in zip(sequence_ids, query_lengths):
+            kv_cache.advance(sequence_id, query_length)
+        return x
