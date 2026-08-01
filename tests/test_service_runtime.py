@@ -12,6 +12,8 @@ from nano_infer_engine.service.runtime import (
     _resolve_gpu_memory_utilization,
     _resolve_kv_cache_safety_margin_bytes,
     _resolve_num_blocks,
+    _resolve_optional_positive_int,
+    _resolve_prefill_scheduling,
     _resolve_served_model_name,
 )
 
@@ -71,6 +73,44 @@ def test_max_model_len_rejects_invalid_values(
 
     with pytest.raises(ValueError, match=message):
         _apply_max_model_len(model_config)
+
+
+def test_optional_positive_int_is_optional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NANO_PREFILL_CHUNK_SIZE", raising=False)
+
+    assert _resolve_optional_positive_int("NANO_PREFILL_CHUNK_SIZE") is None
+
+
+@pytest.mark.parametrize("configured_value", ["invalid", "0", "-1"])
+def test_optional_positive_int_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_value: str,
+) -> None:
+    monkeypatch.setenv("NANO_PREFILL_CHUNK_SIZE", configured_value)
+
+    with pytest.raises(ValueError, match="NANO_PREFILL_CHUNK_SIZE"):
+        _resolve_optional_positive_int("NANO_PREFILL_CHUNK_SIZE")
+
+
+def test_prefill_scheduling_uses_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NANO_PREFILL_CHUNK_SIZE", "128")
+    monkeypatch.setenv("NANO_MAX_PREFILL_TOKENS_PER_STEP", "512")
+
+    assert _resolve_prefill_scheduling() == (128, 512)
+
+
+def test_prefill_budget_requires_chunk_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NANO_PREFILL_CHUNK_SIZE", raising=False)
+    monkeypatch.setenv("NANO_MAX_PREFILL_TOKENS_PER_STEP", "512")
+
+    with pytest.raises(ValueError, match="requires NANO_PREFILL_CHUNK_SIZE"):
+        _resolve_prefill_scheduling()
 
 
 def test_served_model_name_defaults_to_model_path(

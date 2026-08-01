@@ -49,6 +49,7 @@
 - 返回 streaming usage，并以 `[DONE]` 结束流。
 - streaming 客户端断开时取消未完成推理。
 - 通过环境变量配置模型名、最大上下文、生成长度和 batch size。
+- 单 GPU HTTP runtime 可通过 `NANO_PREFILL_CHUNK_SIZE` 和 `NANO_MAX_PREFILL_TOKENS_PER_STEP` 配置 chunked prefill 与全局预算。
 - 根据可配置的 GPU memory utilization 推导 KV block 容量。
 
 ### Prefill/Decode 分离

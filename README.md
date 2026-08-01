@@ -18,6 +18,8 @@ NANO_GPU_MEMORY_UTILIZATION=0.9 \
 NANO_DEVICE=cuda:0 \
 NANO_MAX_BATCH_SIZE=16 \
 NANO_MAX_NEW_TOKENS=256 \
+NANO_PREFILL_CHUNK_SIZE=128 \
+NANO_MAX_PREFILL_TOKENS_PER_STEP=512 \
 uv run uvicorn nano_infer_engine.service.server:app \
   --host 0.0.0.0 \
   --port 8000

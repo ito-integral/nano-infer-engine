@@ -20,6 +20,34 @@ DEFAULT_MODEL_PATH = "/home/a/dm/models/Llama-3.2-1B-Instruct"
 DEFAULT_KV_CACHE_SAFETY_MARGIN_BYTES = 512 * 1024 * 1024
 
 
+def _resolve_optional_positive_int(env_name: str) -> int | None:
+    configured_value = os.getenv(env_name)
+    if configured_value is None:
+        return None
+    try:
+        value = int(configured_value)
+    except ValueError:
+        raise ValueError(f"{env_name} must be an integer") from None
+    if value <= 0:
+        raise ValueError(f"{env_name} must be positive")
+    return value
+
+
+def _resolve_prefill_scheduling() -> tuple[int | None, int | None]:
+    prefill_chunk_size = _resolve_optional_positive_int(
+        "NANO_PREFILL_CHUNK_SIZE"
+    )
+    max_prefill_tokens_per_step = _resolve_optional_positive_int(
+        "NANO_MAX_PREFILL_TOKENS_PER_STEP"
+    )
+    if max_prefill_tokens_per_step is not None and prefill_chunk_size is None:
+        raise ValueError(
+            "NANO_MAX_PREFILL_TOKENS_PER_STEP requires "
+            "NANO_PREFILL_CHUNK_SIZE"
+        )
+    return prefill_chunk_size, max_prefill_tokens_per_step
+
+
 def _apply_max_model_len(model_config: LlamaConfig) -> None:
     configured_value = os.getenv("NANO_MAX_MODEL_LEN")
     if configured_value is None:
@@ -201,6 +229,9 @@ def build_default_runtime() -> InferenceRuntime:
     block_size = int(os.getenv("NANO_BLOCK_SIZE", "16"))
     max_batch_size = int(os.getenv("NANO_MAX_BATCH_SIZE", "8"))
     max_new_tokens = int(os.getenv("NANO_MAX_NEW_TOKENS", "128"))
+    prefill_chunk_size, max_prefill_tokens_per_step = (
+        _resolve_prefill_scheduling()
+    )
 
     model_config = load_convert_hf_config(model_path)
     _apply_max_model_len(model_config)
@@ -229,6 +260,8 @@ def build_default_runtime() -> InferenceRuntime:
             max_new_tokens=max_new_tokens,
             eos_token_id=tokenizer.eos_token_id,
             use_cache=True,
+            prefill_chunk_size=prefill_chunk_size,
+            max_prefill_tokens_per_step=max_prefill_tokens_per_step,
         ),
         paged_cache,
         max_batch_size=max_batch_size,
