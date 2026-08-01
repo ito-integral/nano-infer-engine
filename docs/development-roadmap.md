@@ -28,6 +28,8 @@
 - chunked prefill 的最终 logits 和逐层 KV 已与 one-shot prefill 对齐验证。
 - 请求生命周期包含 pending、prefilling、active、completed、failed 和 cancelled。
 - prefill chunk 与已有 decode step 可以交错执行，避免单个长 prompt 独占一次完整 prefill。
+- chunked 模式将本轮 prefill chunks 与仍需写入 KV 的 decode token 合并为一次 flattened ragged model forward。
+- chunked 模式只在 scheduler step 开头执行 admission；本轮释放 slot 后保留 pending 状态，下一轮开头再接纳，避免无计算收益的末尾状态迁移。
 
 ### 调度与请求生命周期
 
@@ -82,7 +84,7 @@ P/D runtime 使用独立的 prefill/decode 模型、设备和 cache，并负责 
 ## 已知限制
 
 - flattened ragged attention 仍是 correctness-first PyTorch 参考实现，内部按请求循环并 gather KV，尚未接入 FlashAttention varlen、Triton 或 CUDA kernel。
-- chunked prefill 同时支持每请求 `prefill_chunk_size` 和全局每轮 `max_prefill_tokens_per_step`；prefill 与 decode token 尚未合并到同一次 model forward。
+- chunked prefill 同时支持每请求 `prefill_chunk_size` 和全局每轮 `max_prefill_tokens_per_step`；统一 forward 目前仍使用 Python 循环的 reference ragged attention。
 - Paged decode 使用 Python 循环和普通 PyTorch operator，每个 token 会启动较多小 kernel。
 - engine 尚无 CUDA Graph capture，每个 decode iteration 都会返回 Python。
 - SSE detokenization 会反复解码累计 token IDs，尚未使用增量 detokenizer。
@@ -147,13 +149,13 @@ P/D runtime 使用独立的 prefill/decode 模型、设备和 cache，并负责 
 6. 验证 one-shot、chunked 和不同尾块 ragged prefill 的 logits/KV 一致性。
 7. 使用全局 `max_prefill_tokens_per_step` 限制单轮 prefill 总工作量。
 8. 使用轮转队列分配预算，预算不足时优先推进上一轮未获得计算的请求。
+9. 将同一 scheduler step 的 prefill chunks 与 decode tokens 合并为一次 flattened ragged forward。
 
 ### 待完成
 
-1. 评估统一的 prefill/decode token budget；当前 prefill 使用独立预算，并在同一 scheduler step 内先执行 prefill forward、再执行 decode forward。
-2. 评估是否将 prefill 与 decode token 合并到同一个 flattened model forward。
-3. 增加实际 prefill token 数、ragged batch 请求数和 padding-free 利用率指标。
-4. 在混合 prompt 长度与持续请求到达场景下验证长期公平性。
+1. 评估统一的 prefill/decode token budget；当前 prefill budget 不包含 decode token。
+2. 增加实际 prefill token 数、ragged batch 请求数和 padding-free 利用率指标。
+3. 在混合 prompt 长度与持续请求到达场景下验证长期公平性。
 
 ### 验收标准
 
@@ -162,14 +164,14 @@ P/D runtime 使用独立的 prefill/decode 模型、设备和 cache，并负责 
 - 每轮 prefill 工作量受全局 token budget 严格限制。
 - batched/chunked prefill 在定义的 dtype tolerance 内匹配 one-shot prefill。
 
-## 阶段四：优化 Ragged/Paged Attention Kernel（暂缓）
+## 阶段四：使用 Triton 优化 Ragged/Paged Attention
 
-当前先保留 PyTorch reference path，不急于接入 FlashAttention 或 Triton。完成基线、指标和 token-budget scheduler 后，再根据 profiling 结果选择优化方向。
+保留当前 PyTorch reference path 作为正确性基准，下一步尝试使用 Triton kernel 消除 flattened ragged attention 内部的逐请求 Python 循环和 KV gather。
 
 ### 候选任务
 
-1. 评估 FlashAttention varlen 作为 flattened ragged prefill backend。
-2. 为 decode 实现直接读取 block table 的 fused paged-attention kernel。
+1. 定义 Triton ragged attention kernel 的输入元数据：`query_start_loc`、context length、block table 和 sequence length。
+2. 让 kernel 直接读取 Paged KV Cache，避免为每个请求 gather 完整连续 KV。
 3. 支持 ragged sequence length、GQA/MQA 和任意 final-block occupancy。
 4. 使用数值稳定的 online softmax 跨 block 计算。
 5. 减少 kernel launch 和中间 tensor，并针对常见 head dimension 调优。
@@ -224,8 +226,7 @@ P/D runtime 使用独立的 prefill/decode 模型、设备和 cache，并负责 
 -> 增加 scheduler 和阶段耗时指标
 -> 压测并调优全局 prefill token budget
 -> contiguous gather + PyTorch SDPA 对照路径
--> 评估 prefill/decode 统一 flattened batch
--> 根据 profiling 决定 FlashAttention varlen 或 Triton kernel
+-> 为统一 flattened batch 实现 Triton ragged attention kernel
 -> 增量 detokenization 与 CUDA Graph
 -> 内存策略和生产化 P/D transport
 ```

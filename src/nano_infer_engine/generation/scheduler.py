@@ -187,11 +187,10 @@ class ContinuousBatchingScheduler:
             return
         self.paged_cache.release(sequence_id)
 
-    def _admit_pending_requests(
-        self, *, advance_prefill: bool = True
-    ) -> list[PagedRequest]:
+    def _admit_pending_requests(self) -> list[PagedRequest]:
         if self.config.prefill_chunk_size is not None:
-            return self._advance_chunked_prefill(advance_prefill=advance_prefill)
+            self._admit_chunked_requests()
+            return []
 
         failed_requests: list[PagedRequest] = []
         admitted_requests: list[PagedRequest] = []
@@ -253,10 +252,7 @@ class ContinuousBatchingScheduler:
             self.reserved_blocks += request.required_blocks
         return failed_requests
 
-    def _advance_chunked_prefill(
-        self, *, advance_prefill: bool
-    ) -> list[PagedRequest]:
-        terminal_requests: list[PagedRequest] = []
+    def _admit_chunked_requests(self) -> None:
         occupied_slots = len(self.active_requests) + len(self.prefilling_requests)
         while self.pending_requests and occupied_slots < self.max_batch_size:
             request = self.pending_requests[0]
@@ -268,9 +264,9 @@ class ContinuousBatchingScheduler:
             self.reserved_blocks += request.required_blocks
             occupied_slots += 1
 
-        if not advance_prefill or not self.prefilling_requests:
-            return terminal_requests
-
+    def _take_prefill_chunks(
+        self,
+    ) -> tuple[list[PagedRequest], tuple[torch.Tensor, ...]]:
         chunk_size = self.config.prefill_chunk_size
         assert chunk_size is not None
         token_budget = self.config.max_prefill_tokens_per_step
@@ -299,29 +295,15 @@ class ContinuousBatchingScheduler:
             scheduled_requests.append(request)
             token_budget -= scheduled_tokens
 
-        chunks = tuple(chunks_list)
-        sequence_ids = tuple(
-            request.sequence_id for request in scheduled_requests
-        )
-        try:
-            logits = paged_prefill_chunks(
-                self.model,
-                chunks,
-                self.paged_cache,
-                sequence_ids,
-            )
-        except Exception as error:
-            for request in scheduled_requests:
-                request.status = RequestStatus.FAILED
-                request.error = error
-                self.reserved_blocks -= request.required_blocks
-                self._release_request_cache(request.sequence_id)
-                terminal_requests.append(request)
-            return terminal_requests
+        return scheduled_requests, tuple(chunks_list)
 
-        for request, request_logits, chunk in zip(
-            scheduled_requests, logits, chunks
-        ):
+    def _finish_prefill_chunks(
+        self,
+        scheduled_requests: list[PagedRequest],
+        chunks: tuple[torch.Tensor, ...],
+        logits: torch.Tensor,
+    ) -> None:
+        for request, request_logits, chunk in zip(scheduled_requests, logits, chunks):
             request.prefill_offset += chunk.shape[1]
             request.last_logits = request_logits
             if request.prefill_offset == request.prompt.shape[1]:
@@ -331,7 +313,6 @@ class ContinuousBatchingScheduler:
                 # Append incomplete requests after the unscheduled requests so
                 # the next step starts with work that missed this round.
                 self.prefilling_requests.append(request)
-        return terminal_requests
 
     def cancel_request(self, sequence_id: str) -> bool:
         """Cancel a pending or active request and release its cache blocks."""
@@ -397,11 +378,117 @@ class ContinuousBatchingScheduler:
         self.completed_requests.extend(cancelled_requests)
         return tuple(cancelled_requests)
 
+    def _step_unified_ragged(self) -> SchedulerStepOutput:
+        """Run chunked prefill and decode tokens in one flattened forward."""
+        self._admit_chunked_requests()
+        if (
+            not self.active_requests
+            and not self.prefilling_requests
+            and self.pending_requests
+        ):
+            raise RuntimeError("pending requests cannot be admitted")
+        completed_now: list[PagedRequest] = []
+
+        decode_requests = list(self.active_requests)
+        request_logits: list[torch.Tensor] = []
+        for request in decode_requests:
+            if request.last_logits is None:
+                raise RuntimeError("active request is missing logits")
+            request_logits.append(request.last_logits)
+
+        if request_logits:
+            next_tokens = torch.stack(request_logits).argmax(dim=-1, keepdim=True)
+            next_token_ids = next_tokens.squeeze(-1).tolist()
+        else:
+            next_tokens = torch.empty(
+                (0, 1),
+                dtype=torch.long,
+                device=self.paged_cache.keys.device,
+            )
+            next_token_ids = []
+
+        token_events = tuple(
+            TokenEvent(request.sequence_id, next_token_ids[index])
+            for index, request in enumerate(decode_requests)
+        )
+        for index, request in enumerate(decode_requests):
+            request.generated_tokens += 1
+            request.sequence = torch.cat(
+                (request.sequence, next_tokens[index : index + 1]), dim=1
+            )
+
+        if self.config.eos_token_id is None:
+            finished_now = torch.zeros(
+                len(decode_requests),
+                dtype=torch.bool,
+                device=next_tokens.device,
+            )
+        else:
+            finished_now = next_tokens.squeeze(-1).eq(self.config.eos_token_id)
+
+        survivors: list[PagedRequest] = []
+        survivor_tokens: list[torch.Tensor] = []
+        for index, request in enumerate(decode_requests):
+            stopped_by_eos = bool(finished_now[index])
+            reached_token_limit = (
+                request.generated_tokens >= self.config.max_new_tokens
+            )
+            if stopped_by_eos or reached_token_limit:
+                request.finished = stopped_by_eos
+                request.status = RequestStatus.COMPLETED
+                self.reserved_blocks -= request.required_blocks
+                if stopped_by_eos or self.release_on_token_limit:
+                    self._release_request_cache(request.sequence_id)
+                completed_now.append(request)
+            else:
+                survivors.append(request)
+                survivor_tokens.append(next_tokens[index : index + 1])
+        self.active_requests = survivors
+
+        prefill_requests, prefill_chunks = self._take_prefill_chunks()
+        ragged_requests = [*prefill_requests, *survivors]
+        ragged_chunks = (
+            *prefill_chunks,
+            *(token for token in survivor_tokens),
+        )
+        if ragged_requests:
+            try:
+                logits = paged_prefill_chunks(
+                    self.model,
+                    tuple(ragged_chunks),
+                    self.paged_cache,
+                    tuple(request.sequence_id for request in ragged_requests),
+                )
+            except Exception as error:
+                for request in ragged_requests:
+                    request.status = RequestStatus.FAILED
+                    request.error = error
+                    self.reserved_blocks -= request.required_blocks
+                    self._release_request_cache(request.sequence_id)
+                    completed_now.append(request)
+                self.active_requests = []
+            else:
+                prefill_count = len(prefill_requests)
+                self._finish_prefill_chunks(
+                    prefill_requests,
+                    prefill_chunks,
+                    logits[:prefill_count],
+                )
+                for request, request_logits in zip(
+                    survivors, logits[prefill_count:]
+                ):
+                    request.last_logits = request_logits
+
+        self.completed_requests.extend(completed_now)
+        return SchedulerStepOutput(token_events, tuple(completed_now))
+
     @torch.inference_mode()
     def step(self) -> SchedulerStepOutput:
         """Run one iteration and return its tokens and terminal requests."""
         if self._closed:
             raise RuntimeError("scheduler is closed")
+        if self.config.prefill_chunk_size is not None:
+            return self._step_unified_ragged()
         completed_now = self._admit_pending_requests()
         if not self.active_requests:
             if self.pending_requests and not self.prefilling_requests:
@@ -486,7 +573,7 @@ class ContinuousBatchingScheduler:
                     completed_now.append(request)
                 self.active_requests = []
 
-        completed_now.extend(self._admit_pending_requests(advance_prefill=False))
+        completed_now.extend(self._admit_pending_requests())
         self.completed_requests.extend(completed_now)
         return SchedulerStepOutput(token_events, tuple(completed_now))
 

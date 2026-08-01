@@ -564,6 +564,7 @@ def test_scheduler_advances_chunked_prefill_once_per_step() -> None:
     request = scheduler.add_request(
         "request-a", torch.tensor([[1, 2, 3, 4, 5]])
     )
+    next_request = scheduler.add_request("request-b", torch.tensor([[6]]))
 
     assert scheduler.step().token_events == ()
     assert request.status is RequestStatus.PREFILLING
@@ -576,10 +577,25 @@ def test_scheduler_advances_chunked_prefill_once_per_step() -> None:
     assert cache.get_sequence_length(request.sequence_id) == 4
 
     output = scheduler.step()
+    assert output.token_events == ()
+    assert output.terminal_requests == ()
+    assert request.status is RequestStatus.ACTIVE
+    assert request.prefill_offset == 5
+
+    output = scheduler.step()
     assert len(output.token_events) == 1
     assert output.terminal_requests == (request,)
     assert request.status is RequestStatus.COMPLETED
-    assert request.prefill_offset == 5
+    assert next_request.status is RequestStatus.PENDING
+    assert scheduler.pending_count == 1
+
+    output = scheduler.step()
+    assert output.token_events == ()
+    assert next_request.status is RequestStatus.ACTIVE
+    assert scheduler.pending_count == 0
+
+    output = scheduler.step()
+    assert output.terminal_requests == (next_request,)
     assert not scheduler.has_work
 
 
@@ -640,6 +656,77 @@ def test_scheduler_applies_global_prefill_budget_fairly() -> None:
     scheduler.step()
     assert tuple(request.prefill_offset for request in requests) == (3, 3, 3)
     assert all(request.prefill_offset > 0 for request in requests)
+
+
+def test_scheduler_unifies_prefill_and_decode_in_one_ragged_forward() -> None:
+    torch.manual_seed(0)
+    model = Llama3_2(
+        LlamaConfig(
+            vocab_size=16,
+            hidden_size=8,
+            mlp_inner_size=16,
+            num_layers=1,
+            q_head_num=2,
+            kv_head_num=1,
+            rope_type="default",
+            max_seq_len=8,
+            tie_word_embeddings=False,
+        )
+    ).eval()
+    cache = PagedKVCache(
+        num_blocks=12,
+        block_size=1,
+        num_layers=1,
+        kv_head_num=1,
+        head_dim=4,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    scheduler = ContinuousBatchingScheduler(
+        model,
+        GenerationConfig(
+            max_new_tokens=2,
+            use_cache=True,
+            prefill_chunk_size=2,
+        ),
+        cache,
+        max_batch_size=2,
+    )
+    request_a = scheduler.add_request("request-a", torch.tensor([[1]]))
+    request_b = scheduler.add_request(
+        "request-b", torch.tensor([[2, 3, 4, 5]])
+    )
+    calls: list[tuple[tuple[str, ...], tuple[int, ...]]] = []
+    original_forward_ragged = model.forward_ragged
+
+    def recording_forward_ragged(
+        input_ids,
+        *,
+        kv_cache,
+        sequence_ids,
+        query_start_loc,
+    ):
+        calls.append((sequence_ids, tuple(query_start_loc.tolist())))
+        return original_forward_ragged(
+            input_ids,
+            kv_cache=kv_cache,
+            sequence_ids=sequence_ids,
+            query_start_loc=query_start_loc,
+        )
+
+    model.forward_ragged = recording_forward_ragged  # type: ignore[method-assign]
+
+    scheduler.step()
+    assert request_a.status is RequestStatus.ACTIVE
+    assert request_b.status is RequestStatus.PREFILLING
+    calls.clear()
+
+    output = scheduler.step()
+
+    assert len(calls) == 1
+    assert calls == [(('request-b', 'request-a'), (0, 2, 3))]
+    assert output.token_events[0].sequence_id == "request-a"
+    assert request_b.status is RequestStatus.ACTIVE
 
 
 def test_scheduler_cancels_pending_and_active_requests() -> None:
