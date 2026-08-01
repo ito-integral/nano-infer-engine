@@ -583,6 +583,65 @@ def test_scheduler_advances_chunked_prefill_once_per_step() -> None:
     assert not scheduler.has_work
 
 
+def test_scheduler_applies_global_prefill_budget_fairly() -> None:
+    torch.manual_seed(0)
+    model = Llama3_2(
+        LlamaConfig(
+            vocab_size=16,
+            hidden_size=8,
+            mlp_inner_size=16,
+            num_layers=1,
+            q_head_num=2,
+            kv_head_num=1,
+            rope_type="default",
+            max_seq_len=8,
+            tie_word_embeddings=False,
+        )
+    ).eval()
+    cache = PagedKVCache(
+        num_blocks=24,
+        block_size=1,
+        num_layers=1,
+        kv_head_num=1,
+        head_dim=4,
+        dtype=torch.float32,
+        device="cpu",
+    )
+    scheduler = ContinuousBatchingScheduler(
+        model,
+        GenerationConfig(
+            max_new_tokens=1,
+            use_cache=True,
+            prefill_chunk_size=2,
+            max_prefill_tokens_per_step=3,
+        ),
+        cache,
+        max_batch_size=3,
+    )
+    requests = [
+        scheduler.add_request(
+            f"request-{index}", torch.tensor([[1, 2, 3, 4, 5, 6]])
+        )
+        for index in range(3)
+    ]
+
+    scheduler.step()
+    assert tuple(request.prefill_offset for request in requests) == (2, 1, 0)
+    assert sum(
+        cache.get_sequence_length(request.sequence_id) for request in requests
+    ) == 3
+
+    scheduler.step()
+    assert tuple(request.prefill_offset for request in requests) == (3, 1, 2)
+    assert sum(
+        cache.get_sequence_length(request.sequence_id) for request in requests
+    ) == 6
+
+    scheduler.step()
+    assert tuple(request.prefill_offset for request in requests) == (3, 3, 3)
+    assert all(request.prefill_offset > 0 for request in requests)
+
+
 def test_scheduler_cancels_pending_and_active_requests() -> None:
     model = _ScriptedPagedModel(
         {

@@ -273,14 +273,35 @@ class ContinuousBatchingScheduler:
 
         chunk_size = self.config.prefill_chunk_size
         assert chunk_size is not None
-        chunks = tuple(
-            request.prompt[
-                :, request.prefill_offset : request.prefill_offset + chunk_size
-            ]
-            for request in self.prefilling_requests
-        )
+        token_budget = self.config.max_prefill_tokens_per_step
+        if token_budget is None:
+            token_budget = sum(
+                min(
+                    chunk_size,
+                    request.prompt.shape[1] - request.prefill_offset,
+                )
+                for request in self.prefilling_requests
+            )
+
+        scheduled_requests: list[PagedRequest] = []
+        chunks_list: list[torch.Tensor] = []
+        while self.prefilling_requests and token_budget > 0:
+            request = self.prefilling_requests.pop(0)
+            remaining_tokens = request.prompt.shape[1] - request.prefill_offset
+            scheduled_tokens = min(chunk_size, remaining_tokens, token_budget)
+            chunks_list.append(
+                request.prompt[
+                    :,
+                    request.prefill_offset : request.prefill_offset
+                    + scheduled_tokens,
+                ]
+            )
+            scheduled_requests.append(request)
+            token_budget -= scheduled_tokens
+
+        chunks = tuple(chunks_list)
         sequence_ids = tuple(
-            request.sequence_id for request in self.prefilling_requests
+            request.sequence_id for request in scheduled_requests
         )
         try:
             logits = paged_prefill_chunks(
@@ -290,18 +311,16 @@ class ContinuousBatchingScheduler:
                 sequence_ids,
             )
         except Exception as error:
-            for request in self.prefilling_requests:
+            for request in scheduled_requests:
                 request.status = RequestStatus.FAILED
                 request.error = error
                 self.reserved_blocks -= request.required_blocks
                 self._release_request_cache(request.sequence_id)
                 terminal_requests.append(request)
-            self.prefilling_requests = []
             return terminal_requests
 
-        still_prefilling: list[PagedRequest] = []
         for request, request_logits, chunk in zip(
-            self.prefilling_requests, logits, chunks
+            scheduled_requests, logits, chunks
         ):
             request.prefill_offset += chunk.shape[1]
             request.last_logits = request_logits
@@ -309,8 +328,9 @@ class ContinuousBatchingScheduler:
                 request.status = RequestStatus.ACTIVE
                 self.active_requests.append(request)
             else:
-                still_prefilling.append(request)
-        self.prefilling_requests = still_prefilling
+                # Append incomplete requests after the unscheduled requests so
+                # the next step starts with work that missed this round.
+                self.prefilling_requests.append(request)
         return terminal_requests
 
     def cancel_request(self, sequence_id: str) -> bool:
