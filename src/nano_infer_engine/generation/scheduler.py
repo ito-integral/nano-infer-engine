@@ -178,33 +178,60 @@ class ContinuousBatchingScheduler:
 
     def _admit_pending_requests(self) -> list[PagedRequest]:
         failed_requests: list[PagedRequest] = []
+        admitted_requests: list[PagedRequest] = []
         while (
             self.pending_requests
-            and len(self.active_requests) < self.max_batch_size
+            and len(self.active_requests) + len(admitted_requests)
+            < self.max_batch_size
         ):
             request = self.pending_requests[0]
             if (
-                self.reserved_blocks + request.required_blocks
+                self.reserved_blocks
+                + sum(admitted.required_blocks for admitted in admitted_requests)
+                + request.required_blocks
                 > self.block_budget
             ):
                 break
 
             self.pending_requests.popleft()
-            try:
-                logits = paged_prefill(
-                    self.model,
-                    (request.prompt,),
-                    self.paged_cache,
-                    (request.sequence_id,),
-                )
-                request.last_logits = logits[0]
-            except Exception as error:
-                self._release_request_cache(request.sequence_id)
-                request.status = RequestStatus.FAILED
-                request.error = error
-                failed_requests.append(request)
-                continue
+            admitted_requests.append(request)
 
+        if not admitted_requests:
+            return failed_requests
+
+        try:
+            logits = paged_prefill(
+                self.model,
+                tuple(request.prompt for request in admitted_requests),
+                self.paged_cache,
+                tuple(request.sequence_id for request in admitted_requests),
+            )
+        except Exception:
+            # Retry requests separately so one bad prompt does not fail the
+            # other requests that shared its batched prefill attempt.
+            for request in admitted_requests:
+                try:
+                    logits = paged_prefill(
+                        self.model,
+                        (request.prompt,),
+                        self.paged_cache,
+                        (request.sequence_id,),
+                    )
+                    request.last_logits = logits[0]
+                except Exception as error:
+                    self._release_request_cache(request.sequence_id)
+                    request.status = RequestStatus.FAILED
+                    request.error = error
+                    failed_requests.append(request)
+                    continue
+
+                request.status = RequestStatus.ACTIVE
+                self.active_requests.append(request)
+                self.reserved_blocks += request.required_blocks
+            return failed_requests
+
+        for request, request_logits in zip(admitted_requests, logits):
+            request.last_logits = request_logits
             request.status = RequestStatus.ACTIVE
             self.active_requests.append(request)
             self.reserved_blocks += request.required_blocks

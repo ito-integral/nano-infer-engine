@@ -30,6 +30,7 @@ class _ScriptedPagedModel:
         self.decode_batch_sizes: list[int] = []
         self.decode_sequence_ids: list[tuple[str, ...]] = []
         self.prefill_sequence_ids: list[str] = []
+        self.prefill_batch_sizes: list[int] = []
 
     def __call__(
         self,
@@ -43,11 +44,20 @@ class _ScriptedPagedModel:
             current_sequence_ids = (sequence_id,)
             token_count = input_ids.shape[1]
             self.prefill_sequence_ids.append(sequence_id)
+            self.prefill_batch_sizes.append(1)
         else:
             current_sequence_ids = sequence_ids
-            token_count = 1
-            self.decode_batch_sizes.append(len(sequence_ids))
-            self.decode_sequence_ids.append(sequence_ids)
+            is_prefill = all(
+                kv_cache.get_sequence_length(current_sequence_id) == 0
+                for current_sequence_id in current_sequence_ids
+            )
+            token_count = input_ids.shape[1] if is_prefill else 1
+            if is_prefill:
+                self.prefill_sequence_ids.extend(sequence_ids)
+                self.prefill_batch_sizes.append(len(sequence_ids))
+            else:
+                self.decode_batch_sizes.append(len(sequence_ids))
+                self.decode_sequence_ids.append(sequence_ids)
 
         logits = torch.zeros(
             len(current_sequence_ids),
@@ -81,9 +91,16 @@ class _FailingPrefillModel(_ScriptedPagedModel):
         sequence_id: str = "default",
         sequence_ids: tuple[str, ...] | None = None,
     ) -> torch.Tensor:
-        if sequence_ids is None and sequence_id == "request-failed":
-            kv_cache.ensure_capacity(sequence_id, input_ids.shape[1])
-            kv_cache.advance(sequence_id, input_ids.shape[1])
+        current_sequence_ids = (sequence_id,) if sequence_ids is None else sequence_ids
+        if (
+            "request-failed" in current_sequence_ids
+            and all(
+                kv_cache.get_sequence_length(current_sequence_id) == 0
+                for current_sequence_id in current_sequence_ids
+            )
+        ):
+            kv_cache.ensure_capacity("request-failed", input_ids.shape[1])
+            kv_cache.advance("request-failed", input_ids.shape[1])
             raise RuntimeError("prefill failed")
         return super().__call__(
             input_ids,
@@ -110,13 +127,17 @@ class _FailingDecodeModel(_ScriptedPagedModel):
         sequence_id: str = "default",
         sequence_ids: tuple[str, ...] | None = None,
     ) -> torch.Tensor:
+        is_decode = sequence_ids is not None and any(
+            kv_cache.get_sequence_length(current_sequence_id) > 0
+            for current_sequence_id in sequence_ids
+        )
         logits = super().__call__(
             input_ids,
             kv_cache=kv_cache,
             sequence_id=sequence_id,
             sequence_ids=sequence_ids,
         )
-        if sequence_ids == self.failing_sequence_ids:
+        if is_decode and sequence_ids == self.failing_sequence_ids:
             raise RuntimeError("decode failed")
         return logits
 
@@ -302,6 +323,7 @@ def test_paged_greedy_admits_pending_requests_after_eos() -> None:
         "request-b",
         "request-c",
     ]
+    assert model.prefill_batch_sizes == [2, 1]
     assert model.decode_sequence_ids == [
         ("request-b",),
         ("request-b", "request-c"),

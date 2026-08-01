@@ -39,7 +39,11 @@ class _AsyncScriptedModel:
             token_count = input_ids.shape[1]
         else:
             current_sequence_ids = sequence_ids
-            token_count = 1
+            is_prefill = all(
+                kv_cache.get_sequence_length(current_sequence_id) == 0
+                for current_sequence_id in current_sequence_ids
+            )
+            token_count = input_ids.shape[1] if is_prefill else 1
 
         logits = torch.zeros(
             len(current_sequence_ids),
@@ -56,8 +60,8 @@ class _AsyncScriptedModel:
             )
             kv_cache.advance(current_sequence_id, token_count)
             if (
-                sequence_ids is None
-                and current_sequence_id == self.failing_prefill_id
+                current_sequence_id == self.failing_prefill_id
+                and current_length == 0
             ):
                 raise RuntimeError("prefill failed")
 

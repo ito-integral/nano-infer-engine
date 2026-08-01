@@ -60,6 +60,53 @@ def test_paged_prefill_matches_individual_prompt_logits() -> None:
     )
 
 
+def test_paged_prefill_batches_each_prompt_length_once() -> None:
+    model = _build_model()
+    cache = _build_cache(model, num_blocks=8)
+    prompts = (
+        torch.tensor([[1, 4]]),
+        torch.tensor([[1, 5, 8]]),
+        torch.tensor([[1, 6]]),
+        torch.tensor([[1, 7, 10]]),
+    )
+    sequence_ids = ("request-a", "request-b", "request-c", "request-d")
+    calls: list[tuple[tuple[int, int], tuple[str, ...]]] = []
+
+    class RecordingModel:
+        def __call__(
+            self,
+            input_ids: torch.Tensor,
+            *,
+            kv_cache: PagedKVCache,
+            sequence_id: str = "default",
+            sequence_ids: tuple[str, ...] | None = None,
+        ) -> torch.Tensor:
+            current_sequence_ids = sequence_ids or (sequence_id,)
+            calls.append((tuple(input_ids.shape), current_sequence_ids))
+            return model(
+                input_ids,
+                kv_cache=kv_cache,
+                sequence_id=sequence_id,
+                sequence_ids=sequence_ids,
+            )
+
+    with torch.inference_mode():
+        expected = torch.cat(
+            [model(prompt)[:, -1] for prompt in prompts],
+            dim=0,
+        )
+        actual = paged_prefill(RecordingModel(), prompts, cache, sequence_ids)
+
+    assert calls == [
+        ((2, 2), ("request-a", "request-c")),
+        ((2, 3), ("request-b", "request-d")),
+    ]
+    torch.testing.assert_close(actual, expected)
+    assert tuple(
+        cache.get_sequence_length(sequence_id) for sequence_id in sequence_ids
+    ) == (2, 3, 2, 3)
+
+
 def test_paged_prefill_rejects_mismatched_metadata() -> None:
     model = _build_model()
     cache = _build_cache(model)

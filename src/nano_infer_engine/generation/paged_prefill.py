@@ -63,14 +63,45 @@ def paged_prefill(
     if required_blocks > paged_cache.allocator.free_block_count:
         raise ValueError("not enough free blocks")
 
-    logits_list: list[torch.Tensor] = []
+    logits_by_index: list[torch.Tensor | None] = [None] * len(prompts)
+    groups: dict[int, list[int]] = {}
+    for prompt_index, prompt in enumerate(prompts):
+        groups.setdefault(prompt.shape[1], []).append(prompt_index)
 
-    for prompt, sequence_id in zip(prompts, sequence_ids):
-        logits = model(
-            prompt,
-            kv_cache=paged_cache,
-            sequence_id=sequence_id,
-        )
-        logits_list.append(logits[:, -1])
+    try:
+        for prompt_indices in groups.values():
+            batched_prompts = torch.cat(
+                [prompts[prompt_index] for prompt_index in prompt_indices],
+                dim=0,
+            )
+            batched_sequence_ids = tuple(
+                sequence_ids[prompt_index] for prompt_index in prompt_indices
+            )
+            if len(batched_sequence_ids) == 1:
+                logits = model(
+                    batched_prompts,
+                    kv_cache=paged_cache,
+                    sequence_id=batched_sequence_ids[0],
+                )
+            else:
+                logits = model(
+                    batched_prompts,
+                    kv_cache=paged_cache,
+                    sequence_ids=batched_sequence_ids,
+                )
+            last_logits = logits[:, -1]
+            for batch_index, prompt_index in enumerate(prompt_indices):
+                logits_by_index[prompt_index] = last_logits[batch_index]
+    except Exception:
+        # A batched model call can mutate several cache entries before failing.
+        # Restore the all-or-nothing behavior expected by scheduler admission.
+        for sequence_id in sequence_ids:
+            try:
+                paged_cache.release(sequence_id)
+            except KeyError:
+                pass
+        raise
 
-    return torch.cat(logits_list, dim=0)
+    if any(logits is None for logits in logits_by_index):
+        raise RuntimeError("prefill did not produce logits for every prompt")
+    return torch.stack([logits for logits in logits_by_index if logits is not None])
